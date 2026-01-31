@@ -3,3 +3,6 @@ literature/
 
 # Implementation roadmap (local only)
 Implementation_Roadmap.md
+
+# Local worktrees
+.worktrees/
