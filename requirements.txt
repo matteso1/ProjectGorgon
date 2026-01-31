@@ -1,0 +1,6 @@
+torch
+transformers
+bitsandbytes
+datasets
+triton
+accelerate
