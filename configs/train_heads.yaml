@@ -1,0 +1,6 @@
+model_name: meta-llama/Meta-Llama-3-8B-Instruct
+num_heads: 4
+batch_size: 2
+learning_rate: 1.0e-4
+max_steps: 100
+dataset: redpajama
