@@ -6,3 +6,7 @@ Implementation_Roadmap.md
 
 # Local worktrees
 .worktrees/
+
+# Python cache
+__pycache__/
+*.pyc
