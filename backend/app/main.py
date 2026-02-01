@@ -21,8 +21,9 @@ async def generate_stream(ws: WebSocket) -> None:
     await ws.accept()
     try:
         for token in [" The", " quick", " brown", " fox"]:
-            payload = {"text": token, "tree_debug": fake_tree_debug()}
+            payload = {"text": token, "tree_debug": fake_tree_debug(), "done": False}
             await ws.send_json(payload)
             await asyncio.sleep(0.2)
+        await ws.send_json({"text": "", "tree_debug": fake_tree_debug(), "done": True})
     except WebSocketDisconnect:
         return

@@ -1,0 +1,129 @@
+:root {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  font-family: "Inter", system-ui, sans-serif;
+  background: #0b0f1a;
+  color: #e5e7eb;
+}
+
+#root {
+  height: 100vh;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 1fr 420px;
+  height: 100vh;
+}
+
+.left {
+  padding: 24px;
+}
+
+.right {
+  padding: 24px;
+  border-left: 1px solid #1f2937;
+  background: #0f172a;
+  overflow: auto;
+}
+
+h1, h2 {
+  margin: 0 0 12px 0;
+}
+
+.status {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  margin-bottom: 12px;
+  background: #1f2937;
+}
+
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.status.open { background: #064e3b; }
+.status.closed { background: #7f1d1d; }
+.status.connecting { background: #1f2937; }
+.status.done { background: #1e3a8a; }
+
+.replay {
+  border: 1px solid #1f2937;
+  background: #0b1220;
+  color: #e5e7eb;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.replay:hover {
+  border-color: #334155;
+}
+
+.tree-container {
+  position: relative;
+  height: calc(100vh - 140px);
+  border: 1px solid #1f2937;
+  border-radius: 8px;
+  background: #0b1220;
+  overflow: hidden;
+}
+
+.legend {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: rgba(15, 23, 42, 0.7);
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid #1f2937;
+  font-size: 12px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.legend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  display: inline-block;
+}
+
+.legend-dot.accepted { background: #22c55e; }
+.legend-dot.rejected { background: #ef4444; }
+.legend-dot.pending { background: #94a3b8; }
+
+.hud {
+  position: absolute;
+  right: 12px;
+  top: 12px;
+  background: rgba(15, 23, 42, 0.8);
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.output {
+  white-space: pre-wrap;
+  background: #0b1220;
+  border: 1px solid #1f2937;
+  border-radius: 8px;
+  padding: 12px;
+  min-height: 200px;
+}

@@ -30,6 +30,13 @@ def compute_heads_loss(
     return sum(losses)
 
 
+def move_targets_to_device(
+    target_ids: Sequence[torch.Tensor],
+    device: torch.device,
+) -> list[torch.Tensor]:
+    return [targets.to(device) for targets in target_ids]
+
+
 def train_step(
     backbone: nn.Module,
     heads: nn.ModuleList,
@@ -41,12 +48,32 @@ def train_step(
     backbone.eval()
     heads.train()
     with torch.no_grad():
-        outputs = backbone(
-            input_ids=input_ids,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        try:
+            outputs = backbone(
+                input_ids=input_ids,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+            )
+        except TypeError:
+            outputs = backbone(
+                input_ids=input_ids,
+                output_hidden_states=True,
+                return_dict=True,
+            )
         hidden_states = outputs.hidden_states[-1]
+
+    head_param = next(heads.parameters(), None)
+    if head_param is not None:
+        if hidden_states.device != head_param.device or hidden_states.dtype != head_param.dtype:
+            hidden_states = hidden_states.to(
+                device=head_param.device,
+                dtype=head_param.dtype,
+            )
+            if head_param.device.type == "cpu" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        target_ids = move_targets_to_device(target_ids, device=head_param.device)
 
     logits_list = [head(hidden_states) for head in heads]
     loss = compute_heads_loss(logits_list, target_ids, ignore_index=ignore_index)

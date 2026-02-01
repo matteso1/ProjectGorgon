@@ -13,6 +13,7 @@ def load_backbone_4bit(
     num_heads: int,
     token: str | None = None,
     device_map: str | None = "auto",
+    low_cpu_mem_usage: bool = True,
 ) -> Tuple[AutoModelForCausalLM, AutoTokenizer, torch.nn.ModuleList]:
     quant_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -23,6 +24,7 @@ def load_backbone_4bit(
         model_name,
         quantization_config=quant_config,
         device_map=device_map,
+        low_cpu_mem_usage=low_cpu_mem_usage,
         token=token,
     )
     tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
