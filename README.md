@@ -9,10 +9,10 @@
 - Streaming demo UI (FastAPI + React) with tree visualization
 
 ## Status
-- ✅ Kernel microbenchmarks: reference, Triton, CUDA
-- ✅ End-to-end benchmark harness + reporting
-- ⚠️ Draft head acceptance is low with minimal training
-- 🔜 Head training improvements + tree attention verifier integration
+- [done] Kernel microbenchmarks: reference, Triton, CUDA
+- [done] End-to-end benchmark harness + reporting
+- [soon] Draft head acceptance is low with minimal training
+- [soon] Head training improvements + tree attention verifier integration
 
 ## Architecture (High Level)
 ```mermaid
@@ -100,3 +100,4 @@ Llama-3-8B is gated on Hugging Face. You must request access and use a token wit
 - Integrate tree attention verification in the end-to-end loop
 - Full benchmark suite on Llama-3-8B (target >2x speedup)
 - Polished demo + blog post
+
