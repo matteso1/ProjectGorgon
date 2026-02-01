@@ -4,3 +4,5 @@ bitsandbytes
 datasets
 triton
 accelerate
+fastapi
+uvicorn
