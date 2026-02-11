@@ -37,4 +37,11 @@ def load_backbone_4bit(
     heads = torch.nn.ModuleList(
         [MedusaHead(hidden_size=hidden_size, vocab_size=vocab_size) for _ in range(num_heads)]
     )
+
+    # Copy backbone lm_head weights into each Medusa head's lm_head
+    if hasattr(model, 'lm_head'):
+        with torch.no_grad():
+            for head in heads:
+                head.lm_head.weight.data.copy_(model.lm_head.weight.data)
+
     return model, tokenizer, heads

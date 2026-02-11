@@ -1,17 +1,17 @@
 """Core speculative decoding loop with tree-structured verification.
 
 This module implements the full Medusa-style speculative decoding:
-  1. Run backbone on prompt → get hidden state
+  1. Run backbone on prompt -> get hidden state
   2. Draft candidates via Medusa heads (tree-structured)
   3. Verify all candidates in ONE forward pass using tree attention mask
   4. Accept the longest matching prefix, reject the rest
   5. Repeat until max_new_tokens
 
-Architecture note — Tree verification
+Architecture note -- Tree verification
 --------------------------------------
 The candidate tree is flattened into a 1-D token sequence and appended
 to the prompt.  Each candidate's position in this flat sequence has a
-known *tree index*.  We build a mapping from tree index → flat position
+known *tree index*.  We build a mapping from tree index -> flat position
 so that acceptance checking reads the correct verifier logit for each
 candidate.
 
@@ -78,7 +78,7 @@ def accept_draft_tokens(
     return accepted, rejected_at
 
 
-# ─── Verification ────────────────────────────────────────────────────
+# --- Verification --------------------------------------------------------
 
 
 def _build_flat_position_map(tree: CandidateTree) -> Dict[int, int]:
@@ -88,7 +88,7 @@ def _build_flat_position_map(tree: CandidateTree) -> Dict[int, int]:
     occupies flat position ``i`` in the appended draft chunk.  The
     ``prompt_len`` offset is applied *outside* this function.
     """
-    # Identity mapping — tree nodes are appended in order.
+    # Identity mapping -- tree nodes are appended in order.
     return {i: i for i in range(len(tree.parents))}
 
 
@@ -100,32 +100,30 @@ def _path_to_flat_positions(
     return [pos_map[ti] for ti in path]
 
 
+def _trim_kv_cache(past_kv, length: int):
+    """Trim KV cache to first `length` positions."""
+    if past_kv is None:
+        return None
+    return tuple(
+        (k[:, :, :length, :], v[:, :, :length, :])
+        for k, v in past_kv
+    )
+
+
 def _verify_tree_candidates(
     model: nn.Module,
     input_ids: torch.Tensor,
     tree: CandidateTree,
     past_key_values=None,
-) -> Tuple[List[int], int, torch.Tensor]:
+) -> Tuple[List[int], int, torch.Tensor, object]:
     """Verify tree-structured candidates with the backbone.
 
     Runs a single forward pass with all candidate tokens appended
     and uses the verifier logits to find the best accepted path.
 
-    Key insight
-    -----------
-    The verifier logit at position ``p`` predicts the token at position
-    ``p + 1``.  For the first draft candidate (tree node 0, appended at
-    flat position ``prompt_len``), the predicting logit sits at
-    ``prompt_len - 1`` — the last *prompt* position.
-
-    Within the draft chunk the relationship is:
-
-        logit at ``prompt_len + flat_pos_of_node``  predicts  ``flat_pos_of_node + 1``
-
-    But in a tree, a node's "logical predecessor" is its *parent*, not
-    the preceding flat index.  So we verify each path independently: for
-    the *k*-th step along a root-to-leaf path we use the logit at the
-    flat position of the *parent* (or ``prompt_len - 1`` for the root).
+    When past_key_values is provided, input_ids should be just the last
+    accepted token (the KV cache covers earlier positions). We prepend
+    this token to the draft sequence so the model sees [last_token, draft...].
 
     Returns
     -------
@@ -135,22 +133,47 @@ def _verify_tree_candidates(
         Verifier's own prediction after the last accepted token.
     next_hidden : Tensor  (1, 1, hidden_dim)
         Hidden state at the position after the last accepted token.
+    new_past_kv : past_key_values from the verification forward pass.
     """
-    # Flatten tree tokens and append to input
     draft_ids = tree.tokens.unsqueeze(0)  # (1, num_candidates)
-    verifier_input = torch.cat([input_ids, draft_ids], dim=1)
+
+    if past_key_values is not None:
+        # With KV cache: input_ids is just the last token, prepend it to drafts
+        last_token = input_ids[:, -1:]
+        verifier_input = torch.cat([last_token, draft_ids], dim=1)
+        prompt_len = 1  # logit at pos 0 predicts the first draft token
+    else:
+        # Without KV cache: full context
+        verifier_input = torch.cat([input_ids, draft_ids], dim=1)
+        prompt_len = input_ids.shape[1]
 
     with torch.no_grad():
-        outputs = model(
-            verifier_input,
-            output_hidden_states=True,
-            use_cache=False,
-        )
+        try:
+            outputs = model(
+                verifier_input,
+                output_hidden_states=True,
+                use_cache=True,
+                past_key_values=past_key_values,
+            )
+        except TypeError:
+            # Model doesn't support use_cache/past_key_values kwargs
+            # Fall back to full context without cache
+            if past_key_values is not None:
+                verifier_input = torch.cat([input_ids, draft_ids], dim=1)
+                prompt_len = input_ids.shape[1]
+            outputs = model(
+                verifier_input,
+                output_hidden_states=True,
+            )
 
-    prompt_len = input_ids.shape[1]
+    new_past_kv = getattr(outputs, 'past_key_values', None)
     verifier_logits = outputs.logits[0]  # (total_seq_len, vocab)
 
-    # Build position map  (tree_idx → flat offset within draft chunk)
+    # Vectorized: compute all predictions once, transfer to CPU once
+    all_predictions = torch.argmax(verifier_logits, dim=-1).cpu()
+    tree_tokens_cpu = tree.tokens.cpu()
+
+    # Build position map  (tree_idx -> flat offset within draft chunk)
     pos_map = _build_flat_position_map(tree)
 
     # Get all root-to-leaf paths
@@ -158,26 +181,20 @@ def _verify_tree_candidates(
 
     best_accepted: List[int] = []
     best_bonus_token: int = -1
+    winning_path_idx: int = -1
 
-    for path in paths:
+    for path_idx, path in enumerate(paths):
         accepted_tokens: List[int] = []
 
         for step_idx, tree_idx in enumerate(path):
-            # Find the logit that *predicts* this node's token:
-            #   - For the first step (root children), the predicting
-            #     logit is at prompt_len - 1 (the last prompt token).
-            #   - For deeper steps, the predicting logit is at the
-            #     flat position of the *parent* node offset by
-            #     prompt_len.
             parent_tree_idx = tree.parents[tree_idx]
             if parent_tree_idx == -1:
-                # Root child — predicted by the last prompt token
                 logit_pos = prompt_len - 1
             else:
                 logit_pos = prompt_len + pos_map[parent_tree_idx]
 
-            predicted = int(torch.argmax(verifier_logits[logit_pos]).item())
-            draft_token = int(tree.tokens[tree_idx].item())
+            predicted = int(all_predictions[logit_pos].item())
+            draft_token = int(tree_tokens_cpu[tree_idx].item())
 
             if predicted == draft_token:
                 accepted_tokens.append(draft_token)
@@ -190,55 +207,31 @@ def _verify_tree_candidates(
             bonus_logit_pos = prompt_len + pos_map[last_accepted_tree_idx]
         else:
             bonus_logit_pos = prompt_len - 1
-        bonus = int(torch.argmax(verifier_logits[bonus_logit_pos]).item())
+        bonus = int(all_predictions[bonus_logit_pos].item())
 
         if len(accepted_tokens) > len(best_accepted):
             best_accepted = accepted_tokens
             best_bonus_token = bonus
+            winning_path_idx = path_idx
 
     # If no tokens accepted on any path, still grab the bonus
     if not best_accepted:
-        best_bonus_token = int(
-            torch.argmax(verifier_logits[prompt_len - 1]).item()
-        )
+        best_bonus_token = int(all_predictions[prompt_len - 1].item())
 
-    # Hidden state for next iteration: use position after last accepted
-    if best_accepted:
-        # We have specific accepted nodes — take hidden at the last one
-        # (the path that won)
-        winning_path = None
-        for path in paths:
-            acc_check: List[int] = []
-            for step_idx, tree_idx in enumerate(path):
-                parent_tree_idx = tree.parents[tree_idx]
-                if parent_tree_idx == -1:
-                    lp = prompt_len - 1
-                else:
-                    lp = prompt_len + pos_map[parent_tree_idx]
-                pred = int(torch.argmax(verifier_logits[lp]).item())
-                tk = int(tree.tokens[tree_idx].item())
-                if pred == tk:
-                    acc_check.append(tk)
-                else:
-                    break
-            if acc_check == best_accepted:
-                winning_path = path
-                break
-
-        if winning_path:
-            last_tree_idx = winning_path[len(best_accepted) - 1]
-            hidden_pos = prompt_len + pos_map[last_tree_idx]
-        else:
-            hidden_pos = prompt_len - 1
+    # Hidden state for next iteration
+    if best_accepted and winning_path_idx >= 0:
+        winning_path = paths[winning_path_idx]
+        last_tree_idx = winning_path[len(best_accepted) - 1]
+        hidden_pos = prompt_len + pos_map[last_tree_idx]
     else:
         hidden_pos = prompt_len - 1
 
     next_hidden = outputs.hidden_states[-1][:, hidden_pos : hidden_pos + 1, :]
 
-    return best_accepted, best_bonus_token, next_hidden
+    return best_accepted, best_bonus_token, next_hidden, new_past_kv
 
 
-# ─── Main generation loop ────────────────────────────────────────────
+# --- Main generation loop ------------------------------------------------
 
 
 def speculative_generate(
@@ -280,14 +273,21 @@ def speculative_generate(
     total_accepted = 0
     iterations = 0
 
-    # ── Prefill ──────────────────────────────────────────────────────
+    # -- Prefill (try with KV cache, fall back without) --------------------
     with torch.no_grad():
-        outputs = model(
-            input_ids,
-            output_hidden_states=True,
-            use_cache=False,
-        )
+        try:
+            outputs = model(
+                input_ids,
+                output_hidden_states=True,
+                use_cache=True,
+            )
+        except TypeError:
+            outputs = model(
+                input_ids,
+                output_hidden_states=True,
+            )
     hidden = outputs.hidden_states[-1][:, -1:, :]  # (1, 1, hidden_dim)
+    past_key_values = getattr(outputs, 'past_key_values', None)
 
     # Greedy first token from backbone
     first_token = int(torch.argmax(outputs.logits[0, -1]).item())
@@ -302,6 +302,7 @@ def speculative_generate(
         )
 
     # Running context: prompt + generated tokens
+    prompt_len = input_ids.shape[1]
     current_ids = torch.cat(
         [
             input_ids,
@@ -312,13 +313,18 @@ def speculative_generate(
         dim=1,
     )
 
-    # ── Speculative loop ─────────────────────────────────────────────
+    # -- Speculative loop ------------------------------------------------
     while len(generated) < max_new_tokens:
         iterations += 1
 
         # 1. Draft candidates from Medusa heads
-        head_device = next(heads.parameters()).device
-        head_dtype = next(heads.parameters()).dtype
+        try:
+            head_param = next(heads.parameters())
+            head_device = head_param.device
+            head_dtype = head_param.dtype
+        except (AttributeError, StopIteration):
+            head_device = hidden.device
+            head_dtype = hidden.dtype
         hidden_for_heads = hidden.to(device=head_device, dtype=head_dtype)
 
         tree = build_candidate_tree(
@@ -329,11 +335,12 @@ def speculative_generate(
         )
         total_drafted += len(tree.tokens)
 
-        # 2. Verify all candidates in one forward pass
-        accepted, bonus_token, next_hidden = _verify_tree_candidates(
+        # 2. Verify all candidates in one forward pass (with KV cache)
+        accepted, bonus_token, next_hidden, new_past_kv = _verify_tree_candidates(
             model=model,
             input_ids=current_ids,
             tree=tree,
+            past_key_values=past_key_values,
         )
         total_accepted += len(accepted)
 
@@ -361,11 +368,13 @@ def speculative_generate(
             )
             current_ids = torch.cat([current_ids, ext], dim=1)
 
-        # Sliding-window guard for very long sequences
-        if current_ids.shape[1] > prompt_max_length * 2:
-            current_ids = current_ids[:, -prompt_max_length:]
+        # 6. Trim KV cache to accepted positions only
+        # The cache from verification includes draft tokens we may not have accepted.
+        # Trim to: original prompt + all generated tokens so far
+        accepted_length = prompt_len + len(generated)
+        past_key_values = _trim_kv_cache(new_past_kv, accepted_length)
 
-        # 6. Reuse hidden state from verification for next draft
+        # 7. Reuse hidden state from verification for next draft
         hidden = next_hidden
 
     return SpeculativeResult(
@@ -376,7 +385,7 @@ def speculative_generate(
     )
 
 
-# ─── Baseline ────────────────────────────────────────────────────────
+# --- Baseline ------------------------------------------------------------
 
 
 def baseline_generate(

@@ -121,6 +121,32 @@ DATASET_REGISTRY = {
 }
 
 
+def get_dataloader(
+    name: str,
+    tokenizer,
+    seq_length: int = 512,
+    batch_size: int = 4,
+    num_workers: int = 2,
+    pin_memory: bool = True,
+    max_samples: Optional[int] = None,
+) -> "torch.utils.data.DataLoader":
+    """Create a DataLoader wrapping a GorgonDataset."""
+    from torch.utils.data import DataLoader
+
+    dataset = get_dataset(
+        name=name,
+        tokenizer=tokenizer,
+        seq_length=seq_length,
+        max_samples=max_samples,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+
 def get_dataset(
     name: str,
     tokenizer,

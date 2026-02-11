@@ -11,15 +11,15 @@ The heads learn to predict future tokens, enabling speculative decoding.
 
 Memory requirements
 -------------------
-Head architecture: Linear(4096, 4096) → SiLU → Linear(4096, 128256)
-Per-head params: ~541M  ×  4 heads  =  ~2.16B params total
+Head architecture: ResidualBlock(4096) -> Linear(4096, 128256)
+Per-head params: ~541M  x  4 heads  =  ~2.16B params total
 
 With bf16 mixed-precision + Adam:
   - Head params (bf16):        ~4.3 GB
   - Adam states (fp32):       ~17.3 GB
   - Backbone (4-bit):          ~5.0 GB
-  - Activations/gradients:     ~3–5 GB
-  - TOTAL:                    ~30–32 GB
+  - Activations/gradients:     ~3-5 GB
+  - TOTAL:                    ~30-32 GB
 
 Recommended GPU: A100 40GB, A6000 48GB, or A100 80GB.
 Colab Pro+ (A100) works. RunPod A100 40GB (~$1.50/hr) works.
@@ -44,10 +44,10 @@ from tqdm import tqdm
 
 from gorgon.models.backbone import load_backbone_4bit
 from gorgon.models.medusa_heads import MedusaHead
-from gorgon.data.dataset import get_dataset
+from gorgon.data.dataset import get_dataloader
 
 
-# ─── YAML config ─────────────────────────────────────────────────────
+# --- YAML config ---------------------------------------------------------
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -62,18 +62,23 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--dataset", type=str, default="wikitext")
     parser.add_argument("--seq-length", type=int, default=512)
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--save-every", type=int, default=50,
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--save-every", type=int, default=100,
                         help="Save checkpoint every N steps")
     parser.add_argument("--checkpoint-dir", type=str,
                         default=str(ROOT / "checkpoints"))
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume from")
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--grad-accum", type=int, default=1,
-                        help="Gradient accumulation steps (increase to reduce peak memory)")
+    parser.add_argument("--grad-accum", type=int, default=4,
+                        help="Gradient accumulation steps")
     parser.add_argument("--head-dtype", type=str, default="bf16",
                         choices=["fp32", "fp16", "bf16"],
                         help="Dtype for head params (bf16 recommended)")
+    parser.add_argument("--warmup-steps", type=int, default=50,
+                        help="Linear warmup steps for LR scheduler")
+    parser.add_argument("--max-grad-norm", type=float, default=1.0,
+                        help="Max gradient norm for clipping")
     return parser.parse_args(argv)
 
 
@@ -98,20 +103,25 @@ def load_config(args: argparse.Namespace) -> dict:
     config["max_samples"] = args.max_samples
     config["grad_accum"] = args.grad_accum
     config["head_dtype"] = args.head_dtype
+    config["batch_size"] = args.batch_size
+    config["warmup_steps"] = args.warmup_steps
+    config["max_grad_norm"] = args.max_grad_norm
     return config
 
 
-# ─── Checkpointing ───────────────────────────────────────────────────
+# --- Checkpointing -------------------------------------------------------
 
 
 def save_checkpoint(
     heads: torch.nn.ModuleList,
     optimizer: torch.optim.Optimizer,
+    scheduler,
     step: int,
     loss: float,
     config: dict,
     checkpoint_dir: str,
     metrics: dict | None = None,
+    heads_only: bool = False,
 ) -> Path:
     ckpt_dir = Path(checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -120,34 +130,50 @@ def save_checkpoint(
         "step": step,
         "loss": loss,
         "heads_state_dict": heads.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
         "config": config,
     }
+    if not heads_only:
+        payload["optimizer_state_dict"] = optimizer.state_dict()
+        if scheduler is not None:
+            payload["scheduler_state_dict"] = scheduler.state_dict()
     if metrics:
         payload["metrics"] = metrics
 
-    path = ckpt_dir / f"medusa_heads_step{step:06d}.pt"
-    torch.save(payload, path)
+    if heads_only:
+        path = ckpt_dir / f"medusa_heads_step{step:06d}.pt"
+        torch.save(payload, path)
+    else:
+        path = ckpt_dir / "medusa_heads_latest.pt"
+        torch.save(payload, path)
 
-    latest = ckpt_dir / "medusa_heads_latest.pt"
-    torch.save(payload, latest)
     return path
+
+
+def _cleanup_old_checkpoints(checkpoint_dir: str, keep: int = 3) -> None:
+    """Keep only the most recent `keep` step checkpoints."""
+    ckpt_dir = Path(checkpoint_dir)
+    step_ckpts = sorted(ckpt_dir.glob("medusa_heads_step*.pt"))
+    for old in step_ckpts[:-keep]:
+        old.unlink(missing_ok=True)
 
 
 def load_checkpoint(
     path: str,
     heads: torch.nn.ModuleList,
     optimizer: torch.optim.Optimizer | None = None,
+    scheduler=None,
 ) -> int:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     heads.load_state_dict(ckpt["heads_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    if scheduler is not None and "scheduler_state_dict" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     print(f"  Resumed from step {ckpt['step']}, loss={ckpt.get('loss', '?'):.4f}")
     return ckpt["step"]
 
 
-# ─── Training core ───────────────────────────────────────────────────
+# --- Training core -------------------------------------------------------
 
 DTYPE_MAP = {
     "fp32": torch.float32,
@@ -161,7 +187,7 @@ def build_shifted_targets(
     num_heads: int,
     ignore_index: int = -100,
 ) -> list[torch.Tensor]:
-    """Build shifted targets for each head directly (no import dependency).
+    """Build shifted targets for each head directly.
 
     Head k predicts token at position t+k+1 given hidden state at t.
     Target for head k is input_ids shifted left by (k+1).
@@ -170,7 +196,6 @@ def build_shifted_targets(
     seq_len = input_ids.shape[1]
     for k in range(num_heads):
         shift = k + 1
-        # Shifted target: positions shift..end, padded with ignore_index
         if shift < seq_len:
             target = torch.full_like(input_ids, ignore_index)
             target[:, :-shift] = input_ids[:, shift:]
@@ -185,7 +210,6 @@ def train_step_amp(
     heads: torch.nn.ModuleList,
     input_ids: torch.Tensor,
     num_heads: int,
-    optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
     head_dtype: torch.dtype,
     ignore_index: int = -100,
@@ -193,10 +217,10 @@ def train_step_amp(
 ) -> float:
     """Single training step with AMP mixed precision.
 
-    1. Forward backbone (frozen, no_grad) → hidden states
-    2. Forward each head on hidden states → logits
+    1. Forward backbone (frozen, no_grad) -> hidden states
+    2. Forward each head on hidden states -> logits
     3. Cross-entropy loss against shifted targets
-    4. Backward + optimizer step with AMP scaler
+    4. Backward (no optimizer step -- caller handles accumulation)
     """
     backbone.eval()
     heads.train()
@@ -247,15 +271,73 @@ def train_step_amp(
     return total_loss.detach().item() * grad_accum_scale
 
 
+@torch.no_grad()
+def validate(
+    backbone: torch.nn.Module,
+    heads: torch.nn.ModuleList,
+    val_loader,
+    num_heads: int,
+    head_dtype: torch.dtype,
+    device: str,
+    ignore_index: int = -100,
+) -> float:
+    """Run validation and return average loss."""
+    backbone.eval()
+    heads.eval()
+
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
+    total_loss = 0.0
+    count = 0
+
+    for batch in val_loader:
+        input_ids = batch.to(device) if isinstance(batch, torch.Tensor) else batch
+        try:
+            outputs = backbone(
+                input_ids=input_ids,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+            )
+        except TypeError:
+            outputs = backbone(
+                input_ids=input_ids,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        hidden_states = outputs.hidden_states[-1]
+
+        head_param = next(heads.parameters())
+        if hidden_states.device != head_param.device or hidden_states.dtype != head_dtype:
+            hidden_states = hidden_states.to(device=head_param.device, dtype=head_dtype)
+
+        targets = build_shifted_targets(input_ids, num_heads, ignore_index)
+
+        batch_loss = 0.0
+        for k, head in enumerate(heads):
+            logits = head(hidden_states)
+            target = targets[k].to(head_param.device)
+            vocab_size = logits.size(-1)
+            loss = criterion(logits.view(-1, vocab_size), target.view(-1))
+            batch_loss += loss.item()
+
+        total_loss += batch_loss / len(heads)
+        count += 1
+
+    return total_loss / max(count, 1)
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args)
 
     head_dtype = DTYPE_MAP[config["head_dtype"]]
     grad_accum = config["grad_accum"]
+    batch_size = config["batch_size"]
+    warmup_steps = config["warmup_steps"]
+    max_grad_norm = config["max_grad_norm"]
 
     print("=" * 60)
-    print(" Project Gorgon — Medusa Head Training")
+    print(" Project Gorgon -- Medusa Head Training")
     print("=" * 60)
     print(f"  Model:        {config['model_name']}")
     print(f"  Heads:        {config['num_heads']}")
@@ -263,8 +345,11 @@ def main() -> None:
     print(f"  LR:           {config['learning_rate']}")
     print(f"  Dataset:      {config['dataset']}")
     print(f"  Seq len:      {config.get('seq_length', 512)}")
+    print(f"  Batch size:   {batch_size}")
     print(f"  Head dtype:   {config['head_dtype']}")
     print(f"  Grad accum:   {grad_accum}")
+    print(f"  Warmup:       {warmup_steps}")
+    print(f"  Max grad norm:{max_grad_norm}")
     print()
 
     # Device
@@ -278,16 +363,16 @@ def main() -> None:
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"  GPU:          {gpu_name} ({gpu_mem:.1f} GB)")
         if gpu_mem < 30:
-            print(f"  ⚠  WARNING: {gpu_mem:.0f} GB may be insufficient. "
-                  f"Recommend ≥40 GB (A100, A6000).")
+            print(f"  WARNING: {gpu_mem:.0f} GB may be insufficient. "
+                  f"Recommend >=40 GB (A100, A6000).")
 
     # HF token
     hf_token = os.environ.get("HF_TOKEN")
     if not hf_token:
-        print("  ⚠  WARNING: HF_TOKEN not set. Gated models will fail.")
+        print("  WARNING: HF_TOKEN not set. Gated models will fail.")
 
     # Load backbone + heads
-    print("\n⏳ Loading backbone (4-bit)...")
+    print("\nLoading backbone (4-bit)...")
     model, tokenizer, heads = load_backbone_4bit(
         model_name=config["model_name"],
         num_heads=config["num_heads"],
@@ -299,6 +384,13 @@ def main() -> None:
     head_device = device if device != "auto" else "cuda"
     heads = heads.to(device=head_device, dtype=head_dtype)
 
+    # Try torch.compile for speed
+    try:
+        heads = torch.compile(heads)
+        print("  torch.compile: enabled")
+    except Exception:
+        print("  torch.compile: not available, continuing without")
+
     param_count = sum(p.numel() for p in heads.parameters())
     param_gb = param_count * (2 if head_dtype != torch.float32 else 4) / (1024**3)
     print(f"  Head params:  {param_count:,} ({param_gb:.2f} GB in {config['head_dtype']})")
@@ -307,33 +399,62 @@ def main() -> None:
     optimizer = torch.optim.AdamW(heads.parameters(), lr=config["learning_rate"])
     scaler = torch.amp.GradScaler("cuda", enabled=(head_dtype == torch.float16))
 
+    # LR Scheduler: linear warmup + cosine decay
+    max_steps = config["max_steps"]
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-6 / max(config["learning_rate"], 1e-10),
+        total_iters=warmup_steps,
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(max_steps - warmup_steps, 1),
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps],
+    )
+
     # Resume
     start_step = 0
     if config.get("resume"):
-        start_step = load_checkpoint(config["resume"], heads, optimizer)
+        start_step = load_checkpoint(config["resume"], heads, optimizer, scheduler)
 
     # Load dataset
-    print(f"\n⏳ Loading dataset: {config['dataset']}...")
-    dataset = get_dataset(
+    print(f"\nLoading dataset: {config['dataset']}...")
+    train_loader = get_dataloader(
         name=config["dataset"],
         tokenizer=tokenizer,
         seq_length=config.get("seq_length", 512),
+        batch_size=batch_size,
+        num_workers=2,
+        pin_memory=True,
         max_samples=config.get("max_samples"),
     )
-    data_iter = iter(dataset)
+
+    # Validation dataloader (small subset)
+    val_loader = get_dataloader(
+        name=config["dataset"],
+        tokenizer=tokenizer,
+        seq_length=config.get("seq_length", 512),
+        batch_size=batch_size,
+        num_workers=0,
+        pin_memory=False,
+        max_samples=200,
+    )
 
     # Training loop
-    print(f"\n🚀 Training for {config['max_steps']} steps...\n")
+    print(f"\nTraining for {max_steps} steps...\n")
     losses: list[float] = []
     t_start = time.perf_counter()
+    data_iter = iter(train_loader)
 
-    for step in tqdm(range(start_step, config["max_steps"]), desc="Training"):
+    for step in tqdm(range(start_step, max_steps), desc="Training"):
         # Get data
         try:
-            input_ids = next(data_iter).unsqueeze(0)
+            input_ids = next(data_iter)
         except StopIteration:
-            data_iter = iter(dataset)
-            input_ids = next(data_iter).unsqueeze(0)
+            data_iter = iter(train_loader)
+            input_ids = next(data_iter)
 
         # Move to backbone device
         try:
@@ -348,7 +469,6 @@ def main() -> None:
             heads=heads,
             input_ids=input_ids,
             num_heads=config["num_heads"],
-            optimizer=optimizer,
             scaler=scaler,
             head_dtype=head_dtype,
             grad_accum_scale=grad_accum,
@@ -356,9 +476,12 @@ def main() -> None:
 
         # Optimizer step (with gradient accumulation)
         if (step + 1) % grad_accum == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(heads.parameters(), max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
 
         losses.append(loss)
 
@@ -366,41 +489,65 @@ def main() -> None:
         if (step + 1) % 10 == 0:
             avg_loss = sum(losses[-10:]) / len(losses[-10:])
             mem_gb = torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0
+            current_lr = optimizer.param_groups[0]["lr"]
             tqdm.write(
                 f"  Step {step+1:5d} | Loss: {loss:.4f} | "
-                f"Avg(10): {avg_loss:.4f} | Peak VRAM: {mem_gb:.1f} GB"
+                f"Avg(10): {avg_loss:.4f} | LR: {current_lr:.2e} | Peak VRAM: {mem_gb:.1f} GB"
             )
 
-        # Checkpoint
+        # Checkpoint + validation
         if (step + 1) % config["save_every"] == 0:
+            # Validation
+            val_loss = validate(
+                backbone=model,
+                heads=heads,
+                val_loader=val_loader,
+                num_heads=config["num_heads"],
+                head_dtype=head_dtype,
+                device=device,
+            )
+            tqdm.write(f"  Val loss: {val_loss:.4f}")
+
             metrics = {
                 "step": step + 1,
                 "loss": loss,
+                "val_loss": val_loss,
                 "avg_loss_10": sum(losses[-10:]) / len(losses[-10:]),
+                "lr": optimizer.param_groups[0]["lr"],
                 "peak_vram_gb": torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0,
             }
+            # Periodic save: heads only (skip optimizer ~17GB)
             path = save_checkpoint(
-                heads=heads, optimizer=optimizer,
+                heads=heads, optimizer=optimizer, scheduler=scheduler,
                 step=step + 1, loss=loss, config=config,
                 checkpoint_dir=config["checkpoint_dir"],
-                metrics=metrics,
+                metrics=metrics, heads_only=True,
             )
-            tqdm.write(f"  ✓ Saved checkpoint: {path}")
+            tqdm.write(f"  Saved checkpoint: {path}")
+
+            # Full save for resume
+            save_checkpoint(
+                heads=heads, optimizer=optimizer, scheduler=scheduler,
+                step=step + 1, loss=loss, config=config,
+                checkpoint_dir=config["checkpoint_dir"],
+                metrics=metrics, heads_only=False,
+            )
+            _cleanup_old_checkpoints(config["checkpoint_dir"], keep=3)
 
     # Final checkpoint + summary
     elapsed = time.perf_counter() - t_start
     final_metrics = {
-        "total_steps": config["max_steps"],
+        "total_steps": max_steps,
         "final_loss": losses[-1] if losses else 0.0,
         "avg_loss_last_50": sum(losses[-50:]) / len(losses[-50:]) if losses else 0.0,
         "training_time_s": elapsed,
         "peak_vram_gb": torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else 0,
     }
     save_checkpoint(
-        heads=heads, optimizer=optimizer,
-        step=config["max_steps"], loss=losses[-1] if losses else 0.0,
+        heads=heads, optimizer=optimizer, scheduler=scheduler,
+        step=max_steps, loss=losses[-1] if losses else 0.0,
         config=config, checkpoint_dir=config["checkpoint_dir"],
-        metrics=final_metrics,
+        metrics=final_metrics, heads_only=False,
     )
 
     # Save training log
@@ -413,7 +560,7 @@ def main() -> None:
             "loss_history": losses,
         }, f, indent=2)
 
-    print(f"\n✅ Training complete!")
+    print(f"\nTraining complete!")
     print(f"  Total time:     {elapsed:.1f}s ({elapsed/60:.1f} min)")
     print(f"  Final loss:     {losses[-1]:.4f}")
     print(f"  Avg last 50:    {final_metrics['avg_loss_last_50']:.4f}")

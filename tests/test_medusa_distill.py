@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 
 from gorgon.models.medusa_heads import MedusaHead
-from gorgon.training.medusa_distill import distill_heads_last_token
+from gorgon.training.medusa_distill import distill_heads_last_token, distill_heads
 
 
 class DummyBackbone(nn.Module):
@@ -42,3 +42,25 @@ def test_distill_heads_last_token_runs() -> None:
     )
 
     assert isinstance(loss, float)
+
+
+def test_distill_heads_all_positions_runs() -> None:
+    backbone = DummyBackbone(hidden_size=4, vocab_size=8)
+    heads = nn.ModuleList([
+        MedusaHead(hidden_size=4, vocab_size=8),
+        MedusaHead(hidden_size=4, vocab_size=8),
+    ])
+    tokenizer = DummyTokenizer()
+
+    loss = distill_heads(
+        backbone=backbone,
+        heads=heads,
+        tokenizer=tokenizer,
+        prompts=["hello"],
+        steps=2,
+        lr=1e-3,
+        device="cpu",
+    )
+
+    assert isinstance(loss, float)
+    assert loss > 0.0

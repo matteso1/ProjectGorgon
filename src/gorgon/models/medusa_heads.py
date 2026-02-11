@@ -4,14 +4,32 @@ import torch
 import torch.nn as nn
 
 
-class MedusaHead(nn.Module):
-    def __init__(self, hidden_size: int, vocab_size: int):
+class ResidualBlock(nn.Module):
+    """Linear + SiLU with skip connection."""
+
+    def __init__(self, hidden_size: int):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, vocab_size),
-        )
+        self.linear = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.act = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
+        return x + self.act(self.linear(x))
+
+
+class MedusaHead(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        vocab_size: int,
+        num_residual_blocks: int = 1,
+    ):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            [ResidualBlock(hidden_size) for _ in range(num_residual_blocks)]
+        )
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return self.lm_head(x)
