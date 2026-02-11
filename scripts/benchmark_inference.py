@@ -12,9 +12,7 @@ from gorgon.benchmarks.cli import parse_args
 from gorgon.benchmarks.config import BenchmarkConfig
 from gorgon.benchmarks.dry_run import make_dry_report
 from gorgon.benchmarks.entrypoint import build_config_summary
-from gorgon.benchmarks.io import append_report_section
 from gorgon.benchmarks.jsonl import append_jsonl
-from gorgon.benchmarks.orchestrator import format_phase5_report
 from gorgon.benchmarks.pipeline import make_report
 from gorgon.benchmarks.runner import ensure_hf_token, infer_device, select_head_train_device
 from gorgon.benchmarks.runner_core import run_benchmark_trials
@@ -22,7 +20,7 @@ from gorgon.benchmarks.system import gather_system_info
 from gorgon.benchmarks.time_utils import current_date
 from gorgon.benchmarks.report import report_to_dict
 from gorgon.models.backbone import load_backbone_4bit
-from gorgon.training.medusa_bootstrap import train_heads_on_prompts
+from gorgon.training.medusa_distill import distill_heads_last_token
 
 
 def main() -> None:
@@ -54,7 +52,7 @@ def main() -> None:
         )
         if args.head_train_steps > 0:
             train_device = select_head_train_device(device)
-            train_heads_on_prompts(
+            distill_heads_last_token(
                 backbone=model,
                 heads=heads,
                 tokenizer=tokenizer,
@@ -78,8 +76,6 @@ def main() -> None:
             speculative=speculative,
         )
 
-    section = format_phase5_report(report)
-    append_report_section(Path(args.report_path), section)
     jsonl_path = Path(args.report_path).with_suffix(".jsonl")
     append_jsonl(jsonl_path, report_to_dict(report))
 

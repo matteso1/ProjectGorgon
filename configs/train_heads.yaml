@@ -1,6 +1,12 @@
-model_name: meta-llama/Meta-Llama-3-8B-Instruct
+# Project Gorgon — Medusa Head Training Config
+# For use with: python scripts/train_medusa_heads.py --config configs/train_heads.yaml
+
+model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
 num_heads: 4
-batch_size: 2
-learning_rate: 1.0e-4
-max_steps: 100
-dataset: redpajama
+max_steps: 500
+learning_rate: 1e-4
+dataset: "wikitext"
+seq_length: 512
+head_dtype: "bf16"    # bf16 for A100/H100, fp16 for older GPUs (V100)
+grad_accum: 1         # Increase to 4 if tight on memory
+save_every: 50

@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main, gorgon-impl]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Lint
+        run: ruff check src/ tests/ scripts/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers bitsandbytes datasets accelerate tqdm fastapi uvicorn
+          pip install pytest ruff
+          pip install -e .
+      - name: Run tests (CPU only, skip CUDA)
+        run: |
+          pytest tests/ -v --tb=short -k "not cuda and not tree_attention_cuda" \
+            --ignore=tests/test_tree_attention_cuda.py
+
+  dry-benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers bitsandbytes datasets accelerate tqdm fastapi uvicorn
+          pip install -e .
+      - name: Dry-run benchmark
+        run: python scripts/benchmark_inference.py --dry-run --num-trials 1
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install
+        run: npm ci
+      - name: Type check
+        run: npx tsc --noEmit
+      - name: Build
+        run: npm run build

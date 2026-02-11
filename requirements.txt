@@ -4,5 +4,6 @@ bitsandbytes
 datasets
 triton
 accelerate
+tqdm
 fastapi
 uvicorn

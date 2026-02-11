@@ -1,12 +1,8 @@
-# Literature PDFs and references
-literature/
-
-# Implementation roadmap (local only)
-Implementation_Roadmap.md
-
-# Local worktrees
-.worktrees/
-
-# Python cache
+.venv/
 __pycache__/
 *.pyc
+*.egg-info/
+src/gorgon.egg-info/
+checkpoints/
+*.pt
+.DS_Store

@@ -1,3 +1,8 @@
+"""Benchmark inference routines.
+
+Provides `run_baseline()` and `run_speculative()` that return
+`TrialResult` objects for the benchmark harness.
+"""
 from __future__ import annotations
 
 import time
@@ -6,7 +11,11 @@ from typing import Callable, List, Optional
 import torch
 
 from gorgon.benchmarks.trials import TrialResult
-from gorgon.inference.gorgon_loop import accept_draft_tokens
+from gorgon.inference.gorgon_loop import (
+    accept_draft_tokens,
+    speculative_generate,
+    SpeculativeResult,
+)
 
 
 def truncate_prompt_ids(input_ids: torch.Tensor, prompt_max_length: int) -> torch.Tensor:
@@ -117,52 +126,30 @@ def run_speculative(
     num_medusa_heads: int,
     device: str,
     timer: Callable[[], float] = time.perf_counter,
+    top_k: int = 4,
 ) -> TrialResult:
-    inputs = tokenizer(prompt, return_tensors="pt")
-    input_ids = truncate_prompt_ids(inputs["input_ids"], prompt_max_length).to(device)
-    attention_mask = inputs.get("attention_mask")
-    if attention_mask is not None:
-        attention_mask = truncate_prompt_ids(attention_mask, prompt_max_length).to(device)
+    """Run speculative decoding using the full Gorgon loop.
 
+    Uses the tree-structured speculative generation loop for proper
+    multi-head drafting and verification.
+    """
     start = timer()
-    outputs = model(
-        input_ids,
-        attention_mask=attention_mask,
-        output_hidden_states=True,
+
+    result: SpeculativeResult = speculative_generate(
+        model=model,
+        tokenizer=tokenizer,
+        heads=heads,
+        prompt=prompt,
+        max_new_tokens=max_new_tokens,
+        top_k=top_k,
+        prompt_max_length=prompt_max_length,
+        device=device,
     )
-    hidden = outputs.hidden_states[-1][:, -1:, :]
-    draft = _extract_draft_tokens(heads, hidden, num_medusa_heads)
 
-    if not draft:
-        end = timer()
-        return TrialResult(token_count=0, elapsed_s=end - start, acceptance_rate=0.0)
-
-    draft_ids = torch.tensor([draft], device=input_ids.device, dtype=input_ids.dtype)
-    verifier_input = torch.cat([input_ids, draft_ids], dim=1)
-    if attention_mask is not None:
-        draft_mask = torch.ones_like(draft_ids, device=attention_mask.device)
-        verifier_mask = torch.cat([attention_mask, draft_mask], dim=1)
-    else:
-        verifier_mask = None
-
-    verifier_outputs = model(
-        verifier_input,
-        attention_mask=verifier_mask,
-        output_hidden_states=False,
-    )
-    start_idx = input_ids.shape[1] - 1
-    end_idx = start_idx + len(draft)
-    verifier_logits = verifier_outputs.logits[0, start_idx:end_idx, :]
-    accepted, _ = accept_draft_tokens(draft, verifier_logits)
     end = timer()
 
-    token_count = min(max_new_tokens, len(accepted))
-    acceptance_rate: Optional[float] = None
-    if draft:
-        acceptance_rate = len(accepted) / len(draft)
-
     return TrialResult(
-        token_count=token_count,
+        token_count=len(result.generated_ids),
         elapsed_s=end - start,
-        acceptance_rate=acceptance_rate,
+        acceptance_rate=result.acceptance_rate,
     )
