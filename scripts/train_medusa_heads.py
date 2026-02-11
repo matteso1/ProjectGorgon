@@ -396,9 +396,10 @@ def main() -> None:
     head_device = device if device != "auto" else "cuda"
     heads = heads.to(device=head_device, dtype=head_dtype)
 
-    # Try torch.compile for speed
+    # Try torch.compile on individual heads (compiling ModuleList breaks iteration)
     try:
-        heads = torch.compile(heads)
+        for i in range(len(heads)):
+            heads[i] = torch.compile(heads[i])
         print("  torch.compile: enabled")
     except Exception:
         print("  torch.compile: not available, continuing without")
