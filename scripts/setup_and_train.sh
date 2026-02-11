@@ -1,56 +1,53 @@
 #!/bin/bash
-# ════════════════════════════════════════════════════════════════
-#  Project Gorgon — RunPod Training Script (one-shot)
+# ================================================================
+#  Project Gorgon -- RunPod Training Script (one-shot)
 #
 #  Usage: Run on a RunPod A100 pod with runpod/pytorch:2.4.0 image
 #
+#    export HF_TOKEN=hf_YOUR_TOKEN_HERE
 #    git clone -b gorgon-impl https://github.com/matteso1/ProjectGorgon.git
 #    cd ProjectGorgon
 #    bash scripts/setup_and_train.sh
 #
-# ════════════════════════════════════════════════════════════════
+# ================================================================
 set -euo pipefail
 
 echo "============================================================"
-echo " Project Gorgon — RunPod Setup & Train"
+echo " Project Gorgon -- RunPod Setup & Train"
 echo "============================================================"
 echo ""
 
-# ── 1. Verify GPU ────────────────────────────────────────────────
-echo "🔍 Checking GPU..."
+# -- 1. Verify GPU ---------------------------------------------------
+echo "[1/8] Checking GPU..."
 if ! nvidia-smi &>/dev/null; then
-    echo "❌ No GPU detected! Make sure you're on a GPU pod."
+    echo "ERROR: No GPU detected! Make sure you're on a GPU pod."
     exit 1
 fi
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 echo ""
 
-# ── 2. Check PyTorch version and install compatible deps ─────────
-echo "🔍 Checking PyTorch version..."
+# -- 2. Check PyTorch version ----------------------------------------
+echo "[2/8] Checking PyTorch..."
 TORCH_VERSION=$(python -c "import torch; print(torch.__version__)" 2>/dev/null || echo "none")
 echo "   PyTorch: $TORCH_VERSION"
 
 if [[ "$TORCH_VERSION" == "none" ]]; then
-    echo "❌ PyTorch not found! Use a PyTorch template on RunPod."
+    echo "ERROR: PyTorch not found! Use a PyTorch template on RunPod."
     exit 1
 fi
 
-# PyTorch 2.4.x doesn't have set_submodule, so we need transformers<=4.45.2
-# PyTorch 2.5+ has set_submodule, so any transformers version works
 TORCH_MINOR=$(python -c "import torch; v=torch.__version__.split('.'); print(v[1])")
-echo "   PyTorch minor version: $TORCH_MINOR"
-
 if [[ "$TORCH_MINOR" -lt 5 ]]; then
-    echo "   → PyTorch < 2.5 detected, pinning transformers==4.45.2"
+    echo "   -> PyTorch < 2.5 detected, pinning transformers==4.45.2"
     TRANSFORMERS_PIN="transformers==4.45.2"
 else
-    echo "   → PyTorch >= 2.5 detected, using latest transformers"
+    echo "   -> PyTorch >= 2.5, using latest transformers"
     TRANSFORMERS_PIN="transformers"
 fi
 
-# ── 3. Install dependencies ─────────────────────────────────────
+# -- 3. Install dependencies -----------------------------------------
 echo ""
-echo "📦 Installing dependencies..."
+echo "[3/8] Installing dependencies..."
 pip install --no-cache-dir -q \
     "$TRANSFORMERS_PIN" \
     "bitsandbytes>=0.43.0" \
@@ -59,11 +56,11 @@ pip install --no-cache-dir -q \
     "tqdm" \
     "pyyaml"
 
-echo "   ✓ All dependencies installed"
+echo "   Done"
 echo ""
 
-# ── 4. Verify imports work ───────────────────────────────────────
-echo "🔍 Verifying imports..."
+# -- 4. Verify imports -----------------------------------------------
+echo "[4/8] Verifying imports..."
 python -c "
 import torch
 import transformers
@@ -79,44 +76,71 @@ print(f'   CUDA:         {torch.cuda.is_available()}')
 print(f'   GPU:          {torch.cuda.get_device_name(0)}')
 print(f'   VRAM:         {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB')
 "
-echo "   ✓ All imports verified"
 echo ""
 
-# ── 5. Check HF token ───────────────────────────────────────────
+# -- 5. Check HF token -----------------------------------------------
+echo "[5/8] Checking HF token..."
 if [[ -z "${HF_TOKEN:-}" ]]; then
-    echo "⚠  HF_TOKEN not set! Set it before running:"
-    echo "   export HF_TOKEN=hf_YOUR_TOKEN_HERE"
-    echo ""
-    read -rp "Enter your HF token (or press Enter to abort): " HF_TOKEN
+    echo "   HF_TOKEN not set!"
+    read -rp "   Enter your HF token (or press Enter to abort): " HF_TOKEN
     if [[ -z "$HF_TOKEN" ]]; then
-        echo "❌ Aborting — HF_TOKEN is required for Llama-3"
+        echo "ERROR: HF_TOKEN is required for Llama-3"
         exit 1
     fi
     export HF_TOKEN
 fi
-echo "   ✓ HF_TOKEN is set"
+echo "   HF_TOKEN is set"
 echo ""
 
-# ── 6. Install the project in development mode ──────────────────
-echo "📦 Installing project..."
+# -- 6. Install project ----------------------------------------------
+echo "[6/8] Installing project..."
 pip install --no-cache-dir -q -e . 2>/dev/null || true
-echo "   ✓ Project installed"
+echo "   Done"
 echo ""
 
-# ── 7. Train ─────────────────────────────────────────────────────
-echo "🚀 Starting training..."
-echo "   This should take ~20-30 minutes on A100."
-echo "   Checkpoints saved to ./checkpoints/"
+# -- 7. Train ---------------------------------------------------------
+echo "[7/8] Starting training..."
+echo "   Config: batch_size=4, grad_accum=4, warmup=50, cosine LR"
+echo "   Estimated time: ~20-30 min on A100 40GB"
+echo "   Checkpoints: ./checkpoints/"
 echo ""
 
 python scripts/train_medusa_heads.py \
     --config configs/train_heads.yaml \
     --steps 500 \
-    --save-every 50
+    --save-every 100
+
+echo ""
+
+# -- 8. Run benchmark -------------------------------------------------
+echo "[8/8] Running benchmark..."
+echo "   Comparing speculative vs baseline generation"
+echo ""
+
+# Check if benchmark script exists and run it
+if [[ -f scripts/benchmark_inference.py ]]; then
+    python scripts/benchmark_inference.py \
+        --num-trials 3 \
+        --warmup-steps 1 \
+        --max-new-tokens 64 \
+        2>&1 || echo "   Benchmark had errors (non-fatal)"
+else
+    echo "   Benchmark script not found, skipping"
+fi
 
 echo ""
 echo "============================================================"
-echo " ✅ Training complete!"
-echo " Checkpoints are in: ./checkpoints/"
-echo " Download them and stop this pod!"
+echo " DONE!"
+echo ""
+echo " Checkpoints: ./checkpoints/"
+echo " Training log: ./checkpoints/training_log.json"
+echo " Benchmark:    ./reports/ (if available)"
+echo ""
+echo " NEXT STEPS:"
+echo "   1. Download checkpoints/  and reports/"
+echo "   2. Stop this pod to save money!"
+echo ""
+echo " To download from your local machine:"
+echo "   runpodctl receive <pod-id>:checkpoints/"
+echo "   -- or use the RunPod web UI file manager --"
 echo "============================================================"
