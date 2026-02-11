@@ -101,12 +101,24 @@ def _path_to_flat_positions(
 
 
 def _trim_kv_cache(past_kv, length: int):
-    """Trim KV cache to first `length` positions."""
+    """Trim KV cache to first `length` positions.
+
+    Handles both tuple-of-tuples format and HuggingFace DynamicCache.
+    """
     if past_kv is None:
         return None
+
+    # HuggingFace DynamicCache (transformers >= 4.36)
+    if hasattr(past_kv, 'key_cache'):
+        for layer_idx in range(len(past_kv.key_cache)):
+            past_kv.key_cache[layer_idx] = past_kv.key_cache[layer_idx][:, :, :length, :]
+            past_kv.value_cache[layer_idx] = past_kv.value_cache[layer_idx][:, :, :length, :]
+        return past_kv
+
+    # Legacy tuple-of-tuples format
     return tuple(
-        (k[:, :, :length, :], v[:, :, :length, :])
-        for k, v in past_kv
+        (layer[0][:, :, :length, :], layer[1][:, :, :length, :])
+        for layer in past_kv
     )
 
 
