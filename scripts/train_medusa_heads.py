@@ -106,6 +106,18 @@ def load_config(args: argparse.Namespace) -> dict:
     config["batch_size"] = args.batch_size
     config["warmup_steps"] = args.warmup_steps
     config["max_grad_norm"] = args.max_grad_norm
+
+    # Ensure numeric types (YAML can parse 1e-4 as string in some versions)
+    config["learning_rate"] = float(config["learning_rate"])
+    config["max_grad_norm"] = float(config["max_grad_norm"])
+    config["num_heads"] = int(config["num_heads"])
+    config["max_steps"] = int(config["max_steps"])
+    config["seq_length"] = int(config.get("seq_length", 512))
+    config["batch_size"] = int(config["batch_size"])
+    config["grad_accum"] = int(config["grad_accum"])
+    config["warmup_steps"] = int(config["warmup_steps"])
+    config["save_every"] = int(config["save_every"])
+
     return config
 
 
