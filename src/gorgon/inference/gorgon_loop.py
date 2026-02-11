@@ -27,6 +27,11 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+try:
+    from transformers import DynamicCache
+except ImportError:
+    DynamicCache = None
+
 from gorgon.inference.tree_candidates import (
     CandidateTree,
     build_candidate_tree,
@@ -100,29 +105,49 @@ def _path_to_flat_positions(
     return [pos_map[ti] for ti in path]
 
 
+def _tuple_to_dynamic_cache(past_kv_tuple):
+    """Convert a tuple-of-tuples KV cache to DynamicCache.
+
+    Modern transformers (>= 4.36) Llama requires DynamicCache objects,
+    not raw tuples.  This converts [(K, V), ...] -> DynamicCache.
+    """
+    if DynamicCache is None:
+        return past_kv_tuple  # transformers not installed, pass through
+    cache = DynamicCache()
+    for layer_idx, layer in enumerate(past_kv_tuple):
+        cache.update(layer[0], layer[1], layer_idx)
+    return cache
+
+
 def _trim_kv_cache(past_kv, length: int):
     """Trim KV cache to first `length` positions.
 
-    Handles both tuple-of-tuples format and HuggingFace DynamicCache.
+    Always returns a DynamicCache (or None) so that modern transformers
+    models can call get_seq_length() on it.
     """
     if past_kv is None:
         return None
 
-    # HuggingFace DynamicCache (transformers >= 4.36)
+    # Modern DynamicCache with crop() (transformers >= 4.46)
+    if hasattr(past_kv, 'crop'):
+        past_kv.crop(length)
+        return past_kv
+
+    # DynamicCache without crop() (transformers 4.36-4.45)
     if hasattr(past_kv, 'key_cache'):
         for layer_idx in range(len(past_kv.key_cache)):
             past_kv.key_cache[layer_idx] = past_kv.key_cache[layer_idx][:, :, :length, :]
             past_kv.value_cache[layer_idx] = past_kv.value_cache[layer_idx][:, :, :length, :]
-        # Update internal token counter so get_seq_length() returns the correct value
         if hasattr(past_kv, '_seen_tokens'):
             past_kv._seen_tokens = length
         return past_kv
 
-    # Legacy tuple-of-tuples format
-    return tuple(
+    # Legacy tuple-of-tuples -> trim then convert to DynamicCache
+    trimmed = tuple(
         (layer[0][:, :, :length, :], layer[1][:, :, :length, :])
         for layer in past_kv
     )
+    return _tuple_to_dynamic_cache(trimmed)
 
 
 def _verify_tree_candidates(
@@ -182,6 +207,9 @@ def _verify_tree_candidates(
             )
 
     new_past_kv = getattr(outputs, 'past_key_values', None)
+    # Normalize to DynamicCache if model returned a tuple
+    if new_past_kv is not None and isinstance(new_past_kv, tuple):
+        new_past_kv = _tuple_to_dynamic_cache(new_past_kv)
     verifier_logits = outputs.logits[0]  # (total_seq_len, vocab)
 
     # Vectorized: compute all predictions once, transfer to CPU once
@@ -303,6 +331,9 @@ def speculative_generate(
             )
     hidden = outputs.hidden_states[-1][:, -1:, :]  # (1, 1, hidden_dim)
     past_key_values = getattr(outputs, 'past_key_values', None)
+    # Normalize to DynamicCache if model returned a tuple
+    if past_key_values is not None and isinstance(past_key_values, tuple):
+        past_key_values = _tuple_to_dynamic_cache(past_key_values)
 
     # Greedy first token from backbone
     first_token = int(torch.argmax(outputs.logits[0, -1]).item())
