@@ -113,6 +113,9 @@ def _trim_kv_cache(past_kv, length: int):
         for layer_idx in range(len(past_kv.key_cache)):
             past_kv.key_cache[layer_idx] = past_kv.key_cache[layer_idx][:, :, :length, :]
             past_kv.value_cache[layer_idx] = past_kv.value_cache[layer_idx][:, :, :length, :]
+        # Update internal token counter so get_seq_length() returns the correct value
+        if hasattr(past_kv, '_seen_tokens'):
+            past_kv._seen_tokens = length
         return past_kv
 
     # Legacy tuple-of-tuples format
