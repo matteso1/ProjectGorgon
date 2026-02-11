@@ -135,7 +135,7 @@ def _verify_tree_candidates(
         Hidden state at the position after the last accepted token.
     new_past_kv : past_key_values from the verification forward pass.
     """
-    draft_ids = tree.tokens.unsqueeze(0)  # (1, num_candidates)
+    draft_ids = tree.tokens.unsqueeze(0).to(input_ids.device)  # (1, num_candidates)
 
     if past_key_values is not None:
         # With KV cache: input_ids is just the last token, prepend it to drafts
