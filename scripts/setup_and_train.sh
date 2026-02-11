@@ -100,15 +100,13 @@ echo ""
 
 # -- 7. Train ---------------------------------------------------------
 echo "[7/8] Starting training..."
-echo "   Config: batch_size=4, grad_accum=4, warmup=50, cosine LR"
-echo "   Estimated time: ~20-30 min on A100 40GB"
-echo "   Checkpoints: ./checkpoints/"
+echo "   Config: batch_size=4, grad_accum=4, warmup=200, cosine LR"
+echo "   Steps: 10000 (~2.5 hrs on A100)"
+echo "   Checkpoints: ./checkpoints/ (saving every 2000 steps, keeping 1)"
 echo ""
 
 python scripts/train_medusa_heads.py \
-    --config configs/train_heads.yaml \
-    --steps 500 \
-    --save-every 100
+    --config configs/train_heads.yaml
 
 echo ""
 
@@ -120,9 +118,9 @@ echo ""
 # Check if benchmark script exists and run it
 if [[ -f scripts/benchmark_inference.py ]]; then
     python scripts/benchmark_inference.py \
-        --num-trials 3 \
-        --warmup-steps 1 \
-        --max-new-tokens 64 \
+        --num-trials 5 \
+        --warmup-steps 2 \
+        --max-new-tokens 128 \
         2>&1 || echo "   Benchmark had errors (non-fatal)"
 else
     echo "   Benchmark script not found, skipping"

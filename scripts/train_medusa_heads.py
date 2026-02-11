@@ -545,7 +545,7 @@ def main() -> None:
                 checkpoint_dir=config["checkpoint_dir"],
                 metrics=metrics, heads_only=False,
             )
-            _cleanup_old_checkpoints(config["checkpoint_dir"], keep=3)
+            _cleanup_old_checkpoints(config["checkpoint_dir"], keep=1)
 
     # Final checkpoint + summary
     elapsed = time.perf_counter() - t_start
