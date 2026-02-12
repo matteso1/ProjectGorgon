@@ -23,9 +23,22 @@ Project Gorgon accelerates LLM inference by predicting multiple future tokens in
 | **Verification** | Vectorized (single argmax, no GPU syncs in loop) |
 | **Test Coverage** | 90 tests across inference, kernels, training, benchmarks |
 
-<!-- TODO: Add real benchmark numbers after training completes -->
-<!-- | **Acceptance Rate** | TBD% | -->
-<!-- | **Speedup** | TBDx over autoregressive baseline | -->
+### Benchmark (H100 80GB, 30k training steps)
+
+| | Baseline | Speculative |
+|--|----------|-------------|
+| **Tokens/sec** | 35.71 | 23.47 |
+| **Time (2560 tok)** | 71.7s | 109.1s |
+| **Speedup** | -- | 0.66x |
+
+| Head | Acceptance Rate |
+|------|----------------|
+| Head 0 (t+1) | 23.2% |
+| Head 1 (t+2) | 7.9% |
+| Head 2 (t+3) | 5.4% |
+| Head 3 (t+4) | 3.2% |
+
+See the [technical writeup](docs/technical_writeup.md) for the full story of how this went from 0.08x to 0.66x across four bug fixes.
 
 ## Architecture
 
