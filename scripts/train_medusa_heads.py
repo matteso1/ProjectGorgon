@@ -79,6 +79,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Linear warmup steps for LR scheduler")
     parser.add_argument("--max-grad-norm", type=float, default=1.0,
                         help="Max gradient norm for clipping")
+    parser.add_argument("--head-loss-decay", type=float, default=1.0,
+                        help="Per-head loss weight decay: lambda_k = decay^k "
+                             "(Medusa paper uses 0.8)")
     return parser.parse_args(argv)
 
 
@@ -102,6 +105,7 @@ def load_config(args: argparse.Namespace) -> dict:
     config.setdefault("batch_size", args.batch_size)
     config.setdefault("warmup_steps", args.warmup_steps)
     config.setdefault("max_grad_norm", args.max_grad_norm)
+    config.setdefault("head_loss_decay", args.head_loss_decay)
 
     # CLI-only args: always use CLI value
     config["checkpoint_dir"] = args.checkpoint_dir
@@ -119,6 +123,7 @@ def load_config(args: argparse.Namespace) -> dict:
     config["grad_accum"] = int(config["grad_accum"])
     config["warmup_steps"] = int(config["warmup_steps"])
     config["save_every"] = int(config["save_every"])
+    config["head_loss_decay"] = float(config.get("head_loss_decay", 1.0))
 
     return config
 
@@ -230,12 +235,13 @@ def train_step_amp(
     head_dtype: torch.dtype,
     ignore_index: int = -100,
     grad_accum_scale: float = 1.0,
+    head_loss_decay: float = 1.0,
 ) -> float:
     """Single training step with AMP mixed precision.
 
     1. Forward backbone (frozen, no_grad) -> hidden states
     2. Forward each head on hidden states -> logits
-    3. Cross-entropy loss against shifted targets
+    3. Cross-entropy loss against shifted targets (weighted by decay^k)
     4. Backward (no optimizer step -- caller handles accumulation)
     """
     backbone.eval()
@@ -271,14 +277,17 @@ def train_step_amp(
 
     with torch.amp.autocast("cuda", dtype=head_dtype):
         total_loss = torch.tensor(0.0, device=head_param.device)
+        weight_sum = 0.0
         for k, head in enumerate(heads):
             logits = head(hidden_states)  # (B, T, V)
             target = targets[k].to(head_param.device)
             vocab_size = logits.size(-1)
             loss = criterion(logits.view(-1, vocab_size), target.view(-1))
-            total_loss = total_loss + loss
+            w = head_loss_decay ** k  # lambda_k = decay^k (paper: 0.8^k)
+            total_loss = total_loss + w * loss
+            weight_sum += w
 
-        total_loss = total_loss / len(heads)  # Average across heads
+        total_loss = total_loss / weight_sum  # Weighted average
         total_loss = total_loss / grad_accum_scale
 
     # Backward with scaler
@@ -351,6 +360,7 @@ def main() -> None:
     batch_size = config["batch_size"]
     warmup_steps = config["warmup_steps"]
     max_grad_norm = config["max_grad_norm"]
+    head_loss_decay = config.get("head_loss_decay", 1.0)
 
     print("=" * 60)
     print(" Project Gorgon -- Medusa Head Training")
@@ -366,6 +376,7 @@ def main() -> None:
     print(f"  Grad accum:   {grad_accum}")
     print(f"  Warmup:       {warmup_steps}")
     print(f"  Max grad norm:{max_grad_norm}")
+    print(f"  Loss decay:   {head_loss_decay} (lambda_k = {head_loss_decay}^k)")
     print()
 
     # Device
@@ -495,6 +506,7 @@ def main() -> None:
             scaler=scaler,
             head_dtype=head_dtype,
             grad_accum_scale=grad_accum,
+            head_loss_decay=head_loss_decay,
         )
 
         # Optimizer step (with gradient accumulation)

@@ -67,15 +67,41 @@ class GorgonDataset(IterableDataset):
         try:
             ds = load_dataset(self.dataset_name, **kwargs)
         except Exception:
-            # Some datasets don't support streaming; fall back
-            kwargs["streaming"] = False
-            self.streaming = False
-            ds = load_dataset(self.dataset_name, **kwargs)
+            try:
+                # Some datasets don't support streaming; fall back
+                kwargs["streaming"] = False
+                self.streaming = False
+                ds = load_dataset(self.dataset_name, **kwargs)
+            except ValueError:
+                # JSON datasets (e.g. ShareGPT) may not have named splits;
+                # load without split and pick the first available.
+                kwargs.pop("split", None)
+                ds = load_dataset(self.dataset_name, **kwargs)
+                if hasattr(ds, "keys"):
+                    first_split = next(iter(ds.keys()))
+                    ds = ds[first_split]
 
         return ds
 
     def _get_text(self, sample: dict) -> str:
-        """Extract text from sample, auto-detecting the field name."""
+        """Extract text from sample, auto-detecting the field name.
+
+        Handles both plain-text datasets (WikiText, C4) and conversation
+        datasets (ShareGPT) where each sample has a ``conversations``
+        list of ``{"from": ..., "value": ...}`` turns.
+        """
+        # Conversation-format datasets (ShareGPT, etc.)
+        if "conversations" in sample and isinstance(sample["conversations"], list):
+            parts: list[str] = []
+            for turn in sample["conversations"]:
+                if not isinstance(turn, dict):
+                    continue
+                role = turn.get("from", "")
+                value = turn.get("value", "") or ""
+                if value:
+                    parts.append(value)
+            return "\n\n".join(parts)
+
         if self.text_field in sample:
             return sample[self.text_field] or ""
         # Try common field names
@@ -114,6 +140,7 @@ class GorgonDataset(IterableDataset):
 # Verified working as of Feb 2026
 DATASET_REGISTRY = {
     "wikitext": ("wikitext", "wikitext-103-raw-v1", "text"),
+    "sharegpt": ("anon8231489123/ShareGPT_Vicuna_unfiltered", None, "conversations"),
     "openwebtext": ("Skylion007/openwebtext", None, "text"),
     "c4": ("allenai/c4", "en", "text"),
     "redpajama": ("togethercomputer/RedPajama-Data-V2", "sample-10B", "raw_content"),

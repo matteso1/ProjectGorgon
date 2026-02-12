@@ -1,21 +1,25 @@
-# Project Gorgon -- Medusa Head Training Config (v2)
+# Project Gorgon -- Medusa Head Training Config (v3)
 # For use with: python scripts/train_medusa_heads.py --config configs/train_heads.yaml
 #
-# v2 changes:
-#   - MedusaHead now includes frozen RMSNorm from backbone (better init)
-#   - 30k steps for proper convergence
-#   - Higher peak LR (3e-4) with cosine decay to 1e-5 (not zero)
-#   - 500 warmup steps for stable higher LR
+# v3 changes (matching Medusa paper):
+#   - ShareGPT dataset instead of WikiText (conversational data)
+#   - seq_length 2048 (paper uses 2048-4096)
+#   - LR 1e-3 (paper uses 1e-3 for Medusa-1)
+#   - 5 heads (paper recommends 5)
+#   - 40 warmup steps (paper default)
+#   - Per-head loss weighting 0.8^k (head 0 weighted most)
+#   - 2 epochs over ~53k ShareGPT conversations
 
 model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
-num_heads: 4
-max_steps: 30000
-learning_rate: 3e-4
-dataset: "wikitext"
-seq_length: 512
+num_heads: 5
+max_steps: 50000
+learning_rate: 1e-3
+dataset: "sharegpt"
+seq_length: 2048
 head_dtype: "bf16"    # bf16 for A100/H100, fp16 for older GPUs (V100)
 batch_size: 4
 grad_accum: 4
-save_every: 2000
-warmup_steps: 500
+save_every: 5000
+warmup_steps: 40
 max_grad_norm: 1.0
+head_loss_decay: 0.8   # Per-head loss weight: lambda_k = decay^k
