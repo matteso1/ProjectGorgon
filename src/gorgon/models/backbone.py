@@ -94,6 +94,13 @@ def load_trained_heads(
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = ckpt["heads_state_dict"]
 
+    # Handle torch.compile() checkpoints: strip _orig_mod. prefix
+    compiled_prefix = "_orig_mod."
+    if any(k.split(".", 1)[-1].startswith(compiled_prefix) for k in state_dict):
+        state_dict = {
+            k.replace(compiled_prefix, ""): v for k, v in state_dict.items()
+        }
+
     # Handle architecture mismatch: old checkpoints without norm layer
     head_keys = set(heads.state_dict().keys())
     ckpt_keys = set(state_dict.keys())
