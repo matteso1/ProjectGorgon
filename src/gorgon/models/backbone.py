@@ -116,8 +116,11 @@ def load_trained_heads(
         heads.load_state_dict(state_dict)
         print(f"  Loaded checkpoint (step {ckpt['step']}), loss={ckpt.get('loss', '?')}")
 
-    # Ensure heads are on the correct device
+    # Ensure heads are on the correct device and dtype
     if device is not None:
         heads.to(device)
+    # Match dtype of loaded weights (checkpoint may be bf16 or fp16)
+    first_param = next(iter(state_dict.values()))
+    heads.to(first_param.dtype)
 
     return ckpt["step"]
