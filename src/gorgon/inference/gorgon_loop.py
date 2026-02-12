@@ -47,6 +47,41 @@ except ImportError:
     _fused_tree_verify = None
 
 
+class _HiddenCapture:
+    """Captures the post-norm hidden state via a forward hook.
+
+    Avoids passing ``output_hidden_states=True`` to the model, which
+    forces allocation of hidden states for every transformer layer
+    (~33 tensors for Llama-3-8B).  Instead, we hook into the model's
+    final norm layer and grab its output directly.
+    """
+
+    def __init__(self) -> None:
+        self.hidden: Optional[torch.Tensor] = None
+        self._handle = None
+
+    def register(self, model: nn.Module) -> bool:
+        """Attach hook to model.model.norm (Llama-style). Returns False if
+        the model doesn't have the expected structure."""
+        target = None
+        inner = getattr(model, "model", None)
+        if inner is not None:
+            target = getattr(inner, "norm", None)
+        if target is None or not isinstance(target, nn.Module):
+            return False
+
+        def _hook(module, inp, out):
+            self.hidden = out
+
+        self._handle = target.register_forward_hook(_hook)
+        return True
+
+    def remove(self) -> None:
+        if self._handle is not None:
+            self._handle.remove()
+            self._handle = None
+
+
 @dataclass
 class IterationStats:
     """Per-iteration metrics for a single speculative decoding step."""
@@ -213,6 +248,7 @@ def _verify_tree_candidates(
     tree: CandidateTree,
     past_key_values=None,
     use_fused_kernel: bool = False,
+    hidden_capture: Optional[_HiddenCapture] = None,
 ) -> Tuple[List[int], int, torch.Tensor, object]:
     """Verify tree-structured candidates with the backbone.
 
@@ -222,6 +258,14 @@ def _verify_tree_candidates(
     When past_key_values is provided, input_ids should be just the last
     accepted token (the KV cache covers earlier positions). We prepend
     this token to the draft sequence so the model sees [last_token, draft...].
+
+    Parameters
+    ----------
+    hidden_capture : _HiddenCapture, optional
+        If provided (and its hook is active), the hidden state is read from
+        the hook instead of requesting ``output_hidden_states=True``.  This
+        avoids allocating hidden states for all transformer layers on every
+        verification pass.
 
     Returns
     -------
@@ -245,23 +289,25 @@ def _verify_tree_candidates(
         verifier_input = torch.cat([input_ids, draft_ids], dim=1)
         prompt_len = input_ids.shape[1]
 
+    use_hook = hidden_capture is not None and hidden_capture._handle is not None
+    need_hidden_states = not use_hook
+
     with torch.no_grad():
         try:
             outputs = model(
                 verifier_input,
-                output_hidden_states=True,
+                output_hidden_states=need_hidden_states,
                 use_cache=True,
                 past_key_values=past_key_values,
             )
         except TypeError:
             # Model doesn't support use_cache/past_key_values kwargs
-            # Fall back to full context without cache
             if past_key_values is not None:
                 verifier_input = torch.cat([input_ids, draft_ids], dim=1)
                 prompt_len = input_ids.shape[1]
             outputs = model(
                 verifier_input,
-                output_hidden_states=True,
+                output_hidden_states=need_hidden_states,
             )
 
     new_past_kv = getattr(outputs, 'past_key_values', None)
@@ -327,7 +373,12 @@ def _verify_tree_candidates(
     else:
         hidden_pos = prompt_len - 1
 
-    next_hidden = outputs.hidden_states[-1][:, hidden_pos : hidden_pos + 1, :]
+    # Read hidden state from hook (fast) or from output (slow fallback)
+    if use_hook:
+        hidden_all = hidden_capture.hidden
+    else:
+        hidden_all = outputs.hidden_states[-1]
+    next_hidden = hidden_all[:, hidden_pos : hidden_pos + 1, :]
 
     return best_accepted, best_bonus_token, next_hidden, new_past_kv
 
@@ -375,20 +426,28 @@ def speculative_generate(
     iterations = 0
     all_iteration_stats: List[IterationStats] = []
 
+    # -- Register hidden-state hook (avoids output_hidden_states=True) -----
+    capture = _HiddenCapture()
+    hook_active = capture.register(model)
+    need_hidden_states = not hook_active
+
     # -- Prefill (try with KV cache, fall back without) --------------------
     with torch.no_grad():
         try:
             outputs = model(
                 input_ids,
-                output_hidden_states=True,
+                output_hidden_states=need_hidden_states,
                 use_cache=True,
             )
         except TypeError:
             outputs = model(
                 input_ids,
-                output_hidden_states=True,
+                output_hidden_states=need_hidden_states,
             )
-    hidden = outputs.hidden_states[-1][:, -1:, :]  # (1, 1, hidden_dim)
+    if hook_active:
+        hidden = capture.hidden[:, -1:, :]
+    else:
+        hidden = outputs.hidden_states[-1][:, -1:, :]  # (1, 1, hidden_dim)
     past_key_values = getattr(outputs, 'past_key_values', None)
     # Normalize to DynamicCache if model returned a tuple
     if past_key_values is not None and isinstance(past_key_values, tuple):
@@ -463,6 +522,7 @@ def speculative_generate(
             input_ids=current_ids,
             tree=tree,
             past_key_values=past_key_values,
+            hidden_capture=capture,
         )
         total_accepted += len(accepted)
         t_verify_end = time.perf_counter()
@@ -515,6 +575,8 @@ def speculative_generate(
 
         # 8. Reuse hidden state from verification for next draft
         hidden = next_hidden
+
+    capture.remove()
 
     return SpeculativeResult(
         generated_ids=generated,
