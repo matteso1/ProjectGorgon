@@ -140,7 +140,7 @@ class GorgonDataset(IterableDataset):
 # Verified working as of Feb 2026
 DATASET_REGISTRY = {
     "wikitext": ("wikitext", "wikitext-103-raw-v1", "text"),
-    "sharegpt": ("anon8231489123/ShareGPT_Vicuna_unfiltered", None, "conversations"),
+    "sharegpt": ("RyokoAI/ShareGPT52K", None, "conversations"),
     "openwebtext": ("Skylion007/openwebtext", None, "text"),
     "c4": ("allenai/c4", "en", "text"),
     "redpajama": ("togethercomputer/RedPajama-Data-V2", "sample-10B", "raw_content"),
