@@ -12,17 +12,17 @@ The heads learn to predict future tokens, enabling speculative decoding.
 Memory requirements
 -------------------
 Head architecture: ResidualBlock(4096) -> Linear(4096, 128256)
-Per-head params: ~541M  x  4 heads  =  ~2.16B params total
+Per-head params: ~541M  x  5 heads  =  ~2.7B params total
 
-With bf16 mixed-precision + Adam:
-  - Head params (bf16):        ~4.3 GB
-  - Adam states (fp32):       ~17.3 GB
+With bf16 mixed-precision + Adam (5 heads, seq_length=2048):
+  - Head params (bf16):        ~5.4 GB
+  - Adam states (fp32):       ~21.6 GB
   - Backbone (4-bit):          ~5.0 GB
-  - Activations/gradients:     ~3-5 GB
-  - TOTAL:                    ~30-32 GB
+  - Activations/gradients:     ~5-8 GB
+  - TOTAL:                    ~37-40 GB
 
-Recommended GPU: A100 40GB, A6000 48GB, or A100 80GB.
-Colab Pro+ (A100) works. RunPod A100 40GB (~$1.50/hr) works.
+Recommended GPU: A100 80GB or H100 80GB.
+Colab Pro (H100) works. A100 40GB may OOM with 5 heads + seq_length 2048.
 """
 from __future__ import annotations
 
