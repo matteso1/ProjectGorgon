@@ -116,4 +116,8 @@ def load_trained_heads(
         heads.load_state_dict(state_dict)
         print(f"  Loaded checkpoint (step {ckpt['step']}), loss={ckpt.get('loss', '?')}")
 
+    # Ensure heads are on the correct device
+    if device is not None:
+        heads.to(device)
+
     return ckpt["step"]
