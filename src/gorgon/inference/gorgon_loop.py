@@ -48,12 +48,17 @@ except ImportError:
 
 
 class _HiddenCapture:
-    """Captures the post-norm hidden state via a forward hook.
+    """Captures the pre-norm hidden state via a forward hook on model.norm.
 
     Avoids passing ``output_hidden_states=True`` to the model, which
     forces allocation of hidden states for every transformer layer
     (~33 tensors for Llama-3-8B).  Instead, we hook into the model's
-    final norm layer and grab its output directly.
+    final norm layer and grab its **input** (pre-norm hidden state).
+
+    We capture the *input* to model.norm rather than the output because
+    MedusaHead includes its own frozen copy of RMSNorm.  Training uses
+    ``outputs.hidden_states[-1]`` which is pre-norm, so inference must
+    match.  Using the norm output would double-norm the hidden state.
     """
 
     def __init__(self) -> None:
@@ -71,7 +76,11 @@ class _HiddenCapture:
             return False
 
         def _hook(module, inp, out):
-            self.hidden = out
+            # Capture the INPUT to model.norm (pre-norm hidden state).
+            # Training uses outputs.hidden_states[-1] which is also pre-norm.
+            # Using ``out`` here would give post-norm, causing a double-norm
+            # mismatch because MedusaHead applies its own frozen RMSNorm.
+            self.hidden = inp[0]
 
         self._handle = target.register_forward_hook(_hook)
         return True
