@@ -17,11 +17,19 @@ def test_run_benchmark_trials_returns_runs(monkeypatch) -> None:
 
     monkeypatch.setattr(
         "gorgon.benchmarks.runner_core.run_baseline",
-        lambda *args, **kwargs: type("T", (), {"token_count": 2, "elapsed_s": 2.0, "acceptance_rate": None})(),
+        lambda *args, **kwargs: type("T", (), {
+            "token_count": 2, "elapsed_s": 2.0, "acceptance_rate": None,
+            "mean_accepted_length": None, "per_head_acceptance": None,
+            "tree_utilization": None, "time_breakdown": None,
+        })(),
     )
     monkeypatch.setattr(
         "gorgon.benchmarks.runner_core.run_speculative",
-        lambda *args, **kwargs: type("T", (), {"token_count": 2, "elapsed_s": 1.0, "acceptance_rate": 1.0})(),
+        lambda *args, **kwargs: type("T", (), {
+            "token_count": 2, "elapsed_s": 1.0, "acceptance_rate": 1.0,
+            "mean_accepted_length": None, "per_head_acceptance": None,
+            "tree_utilization": None, "time_breakdown": None,
+        })(),
     )
 
     baseline, speculative = run_benchmark_trials(Dummy(), Dummy(), Dummy(), config, device="cpu")

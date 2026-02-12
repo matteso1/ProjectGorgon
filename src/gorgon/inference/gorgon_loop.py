@@ -21,7 +21,8 @@ the last prompt position (``prompt_len - 1``).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -40,6 +41,23 @@ from gorgon.inference.tree_candidates import (
 )
 from gorgon.inference.kv_cache import GorgonKVCache
 
+try:
+    from gorgon.kernels.fused_tree_verify_triton import fused_tree_verify as _fused_tree_verify
+except ImportError:
+    _fused_tree_verify = None
+
+
+@dataclass
+class IterationStats:
+    """Per-iteration metrics for a single speculative decoding step."""
+
+    tree_size: int
+    accepted_length: int
+    head_acceptance: List[bool]
+    time_draft_ms: float
+    time_verify_ms: float
+    time_kv_trim_ms: float
+
 
 @dataclass
 class SpeculativeResult:
@@ -49,12 +67,51 @@ class SpeculativeResult:
     total_draft_tokens: int
     total_accepted_tokens: int
     num_iterations: int
+    iteration_stats: List[IterationStats] = field(default_factory=list)
 
     @property
     def acceptance_rate(self) -> float:
         if self.total_draft_tokens == 0:
             return 0.0
         return self.total_accepted_tokens / self.total_draft_tokens
+
+    @property
+    def mean_accepted_length(self) -> float:
+        """Mean accepted tokens per iteration (tau)."""
+        if not self.iteration_stats:
+            return 0.0
+        return sum(s.accepted_length for s in self.iteration_stats) / len(
+            self.iteration_stats
+        )
+
+    @property
+    def per_head_acceptance_rates(self) -> List[float]:
+        """Acceptance rate for each head position across all iterations."""
+        if not self.iteration_stats:
+            return []
+        max_depth = max(len(s.head_acceptance) for s in self.iteration_stats)
+        rates: List[float] = []
+        for h in range(max_depth):
+            total = 0
+            accepted = 0
+            for s in self.iteration_stats:
+                if h < len(s.head_acceptance):
+                    total += 1
+                    if s.head_acceptance[h]:
+                        accepted += 1
+            rates.append(accepted / total if total > 0 else 0.0)
+        return rates
+
+    @property
+    def tree_utilization(self) -> float:
+        """Fraction of tree nodes that were accepted on average."""
+        if not self.iteration_stats:
+            return 0.0
+        utils = []
+        for s in self.iteration_stats:
+            if s.tree_size > 0:
+                utils.append(s.accepted_length / s.tree_size)
+        return sum(utils) / len(utils) if utils else 0.0
 
 
 def accept_draft_tokens(
@@ -155,6 +212,7 @@ def _verify_tree_candidates(
     input_ids: torch.Tensor,
     tree: CandidateTree,
     past_key_values=None,
+    use_fused_kernel: bool = False,
 ) -> Tuple[List[int], int, torch.Tensor, object]:
     """Verify tree-structured candidates with the backbone.
 
@@ -315,6 +373,7 @@ def speculative_generate(
     total_drafted = 0
     total_accepted = 0
     iterations = 0
+    all_iteration_stats: List[IterationStats] = []
 
     # -- Prefill (try with KV cache, fall back without) --------------------
     with torch.no_grad():
@@ -364,6 +423,7 @@ def speculative_generate(
         iterations += 1
 
         # 1. Draft candidates from Medusa heads
+        t_draft_start = time.perf_counter()
         try:
             head_param = next(heads.parameters())
             head_device = head_param.device
@@ -380,8 +440,24 @@ def speculative_generate(
             max_depth=len(heads),
         )
         total_drafted += len(tree.tokens)
+        t_draft_end = time.perf_counter()
+
+        # Handle empty tree (all candidates pruned by adaptive pruning)
+        if len(tree.tokens) == 0:
+            all_iteration_stats.append(
+                IterationStats(
+                    tree_size=0,
+                    accepted_length=0,
+                    head_acceptance=[],
+                    time_draft_ms=(t_draft_end - t_draft_start) * 1000.0,
+                    time_verify_ms=0.0,
+                    time_kv_trim_ms=0.0,
+                )
+            )
+            break
 
         # 2. Verify all candidates in one forward pass (with KV cache)
+        t_verify_start = time.perf_counter()
         accepted, bonus_token, next_hidden, new_past_kv = _verify_tree_candidates(
             model=model,
             input_ids=current_ids,
@@ -389,6 +465,11 @@ def speculative_generate(
             past_key_values=past_key_values,
         )
         total_accepted += len(accepted)
+        t_verify_end = time.perf_counter()
+
+        # Build per-head acceptance: head i accepted if accepted_length > i
+        num_heads_used = tree.depth
+        head_acceptance = [i < len(accepted) for i in range(num_heads_used)]
 
         # 3. Collect new tokens (accepted + bonus)
         new_tokens = accepted + [bonus_token]
@@ -415,12 +496,24 @@ def speculative_generate(
             current_ids = torch.cat([current_ids, ext], dim=1)
 
         # 6. Trim KV cache to accepted positions only
-        # The cache from verification includes draft tokens we may not have accepted.
-        # Trim to: original prompt + all generated tokens so far
+        t_trim_start = time.perf_counter()
         accepted_length = prompt_len + len(generated)
         past_key_values = _trim_kv_cache(new_past_kv, accepted_length)
+        t_trim_end = time.perf_counter()
 
-        # 7. Reuse hidden state from verification for next draft
+        # 7. Record iteration stats
+        all_iteration_stats.append(
+            IterationStats(
+                tree_size=len(tree.tokens),
+                accepted_length=len(accepted),
+                head_acceptance=head_acceptance,
+                time_draft_ms=(t_draft_end - t_draft_start) * 1000.0,
+                time_verify_ms=(t_verify_end - t_verify_start) * 1000.0,
+                time_kv_trim_ms=(t_trim_end - t_trim_start) * 1000.0,
+            )
+        )
+
+        # 8. Reuse hidden state from verification for next draft
         hidden = next_hidden
 
     return SpeculativeResult(
@@ -428,6 +521,7 @@ def speculative_generate(
         total_draft_tokens=total_drafted,
         total_accepted_tokens=total_accepted,
         num_iterations=iterations,
+        iteration_stats=all_iteration_stats,
     )
 
 

@@ -22,18 +22,29 @@ class CandidateTree:
         tokens:  (num_candidates,) -- token IDs in tree order.
         parents: (num_candidates,) -- parent index for each node (-1 = root).
         depth:   maximum depth of the tree (= number of heads used).
+        scores:  (num_candidates,) -- softmax probabilities (optional).
     """
     tokens: torch.Tensor
     parents: List[int]
     depth: int
+    scores: torch.Tensor | None = None
+
+
+@dataclass
+class _HeadTopk:
+    """Top-k results from a single head."""
+    ids: torch.Tensor
+    scores: torch.Tensor
+    probs: torch.Tensor
+    entropy: float
 
 
 def _topk_per_head(
     heads: nn.ModuleList,
     hidden: torch.Tensor,
     k: int,
-) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    """Return top-k token IDs and scores from each head.
+) -> List[_HeadTopk]:
+    """Return top-k token IDs, scores, probs, and entropy from each head.
 
     Args:
         heads:  Medusa heads (nn.ModuleList).
@@ -41,10 +52,9 @@ def _topk_per_head(
         k:      number of top-k candidates per head.
 
     Returns:
-        list of (ids, scores) tuples, one per head.
-        ids: (k,) tensor of token IDs, scores: (k,) tensor of logit values.
+        list of _HeadTopk, one per head.
     """
-    results: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    results: List[_HeadTopk] = []
     for head in heads:
         with torch.no_grad():
             logits = head(hidden)  # (1, 1, vocab) or (1, vocab)
@@ -52,10 +62,31 @@ def _topk_per_head(
                 logits = logits[0, 0]  # (vocab,)
             elif logits.dim() == 2:
                 logits = logits[0]     # (vocab,)
+
+            # Full distribution for entropy
+            full_probs = torch.softmax(logits, dim=-1)
+            log_probs = torch.log(full_probs + 1e-10)
+            entropy = float(-(full_probs * log_probs).sum().item())
+
             actual_k = min(k, logits.shape[-1])
             scores, ids = torch.topk(logits, actual_k)
-            results.append((ids.cpu(), scores.cpu()))
+            probs = torch.softmax(scores, dim=-1)
+
+            results.append(_HeadTopk(
+                ids=ids.cpu(),
+                scores=scores.cpu(),
+                probs=probs.cpu(),
+                entropy=entropy,
+            ))
     return results
+
+
+def _max_entropy(k: int) -> float:
+    """Maximum entropy of a uniform distribution over k items."""
+    import math
+    if k <= 1:
+        return 1.0
+    return math.log(k)
 
 
 def build_candidate_tree(
@@ -64,6 +95,9 @@ def build_candidate_tree(
     top_k: int = 4,
     max_depth: int | None = None,
     max_candidates: int | None = None,
+    confidence_threshold: float = 0.0,
+    use_path_confidence: bool = False,
+    entropy_weighted: bool = False,
 ) -> CandidateTree:
     """Build a flat candidate tree from Medusa head predictions.
 
@@ -76,15 +110,24 @@ def build_candidate_tree(
     When max_candidates is set, at each level only the highest-scoring
     parents are expanded until the budget is exhausted.
 
+    Adaptive pruning parameters:
+        confidence_threshold: min softmax probability to keep a branch (0=off).
+        use_path_confidence:  prune on cumulative path probability product.
+        entropy_weighted:     scale threshold by head entropy (uncertain heads
+                              expand more).
+
     Args:
         heads:          Medusa heads.
         hidden:         (1, 1, hidden_dim) last hidden state.
         top_k:          candidates per head per level.
         max_depth:      max tree depth (default: len(heads)).
         max_candidates: total candidate budget (default: None = unlimited).
+        confidence_threshold: min probability to keep candidate (default: 0.0).
+        use_path_confidence:  prune on cumulative path prob (default: False).
+        entropy_weighted:     entropy-adaptive threshold (default: False).
 
     Returns:
-        CandidateTree with flat tokens, parents, and depth.
+        CandidateTree with flat tokens, parents, depth, and scores.
     """
     num_heads = len(heads)
     depth = min(max_depth or num_heads, num_heads)
@@ -93,21 +136,38 @@ def build_candidate_tree(
 
     all_tokens: List[int] = []
     all_parents: List[int] = []
+    all_probs: List[float] = []
+    # Track path probability for each node (for use_path_confidence)
+    path_probs: List[float] = []
 
     budget_remaining = max_candidates  # None means unlimited
 
     # Level 1: children of root (index -1 means root).
     level_indices: List[int] = []
     level_scores: List[float] = []
-    ids_0, scores_0 = topk_per_level[0]
-    for i, tok in enumerate(ids_0.tolist()):
+    head_0 = topk_per_level[0]
+
+    # Compute effective threshold for this head
+    if confidence_threshold > 0 and entropy_weighted:
+        max_ent = _max_entropy(top_k)
+        normalized_entropy = head_0.entropy / max_ent if max_ent > 0 else 0.0
+        effective_threshold = confidence_threshold * (1.0 - normalized_entropy)
+    else:
+        effective_threshold = confidence_threshold
+
+    for i, tok in enumerate(head_0.ids.tolist()):
         if budget_remaining is not None and budget_remaining <= 0:
             break
+        prob = float(head_0.probs[i].item())
+        if confidence_threshold > 0 and prob < effective_threshold:
+            continue
         idx = len(all_tokens)
         all_tokens.append(tok)
         all_parents.append(-1)
+        all_probs.append(prob)
+        path_probs.append(prob)
         level_indices.append(idx)
-        level_scores.append(float(scores_0[i].item()))
+        level_scores.append(float(head_0.scores[i].item()))
         if budget_remaining is not None:
             budget_remaining -= 1
 
@@ -116,8 +176,16 @@ def build_candidate_tree(
         if budget_remaining is not None and budget_remaining <= 0:
             break
 
-        ids_l, scores_l = topk_per_level[level]
-        tok_list = ids_l.tolist()
+        head_l = topk_per_level[level]
+        tok_list = head_l.ids.tolist()
+
+        # Compute effective threshold for this head
+        if confidence_threshold > 0 and entropy_weighted:
+            max_ent = _max_entropy(top_k)
+            normalized_entropy = head_l.entropy / max_ent if max_ent > 0 else 0.0
+            level_effective_threshold = confidence_threshold * (1.0 - normalized_entropy)
+        else:
+            level_effective_threshold = confidence_threshold
 
         # Sort parents by their score (descending) for budget-aware expansion
         if max_candidates is not None:
@@ -130,24 +198,50 @@ def build_candidate_tree(
         next_level_indices: List[int] = []
         next_level_scores: List[float] = []
         for parent_idx, _ in sorted_parents:
+            parent_path_prob = path_probs[parent_idx]
             for i, tok in enumerate(tok_list):
                 if budget_remaining is not None and budget_remaining <= 0:
                     break
+                prob = float(head_l.probs[i].item())
+
+                # Confidence pruning
+                if confidence_threshold > 0 and prob < level_effective_threshold:
+                    continue
+
+                # Path confidence pruning
+                child_path_prob = parent_path_prob * prob
+                if use_path_confidence and confidence_threshold > 0:
+                    if child_path_prob < level_effective_threshold:
+                        continue
+
                 idx = len(all_tokens)
                 all_tokens.append(tok)
                 all_parents.append(parent_idx)
+                all_probs.append(prob)
+                path_probs.append(child_path_prob)
                 next_level_indices.append(idx)
-                next_level_scores.append(float(scores_l[i].item()))
+                next_level_scores.append(float(head_l.scores[i].item()))
                 if budget_remaining is not None:
                     budget_remaining -= 1
         level_indices = next_level_indices
         level_scores = next_level_scores
 
     device = hidden.device
+
+    # Handle empty tree (all candidates pruned)
+    if not all_tokens:
+        return CandidateTree(
+            tokens=torch.tensor([], dtype=torch.long, device=device),
+            parents=[],
+            depth=depth,
+            scores=torch.tensor([], dtype=torch.float32, device=device),
+        )
+
     return CandidateTree(
         tokens=torch.tensor(all_tokens, dtype=torch.long, device=device),
         parents=all_parents,
         depth=depth,
+        scores=torch.tensor(all_probs, dtype=torch.float32, device=device),
     )
 
 

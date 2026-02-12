@@ -89,23 +89,25 @@ def load_config(args: argparse.Namespace) -> dict:
         with open(args.config) as f:
             config = yaml.safe_load(f) or {}
 
+    # YAML-configurable values: YAML wins over CLI defaults
     config.setdefault("model_name", args.model_name)
     config.setdefault("num_heads", args.num_heads)
     config.setdefault("max_steps", args.steps)
     config.setdefault("learning_rate", args.lr)
     config.setdefault("dataset", args.dataset)
     config.setdefault("seq_length", args.seq_length)
+    config.setdefault("save_every", args.save_every)
+    config.setdefault("grad_accum", args.grad_accum)
+    config.setdefault("head_dtype", args.head_dtype)
+    config.setdefault("batch_size", args.batch_size)
+    config.setdefault("warmup_steps", args.warmup_steps)
+    config.setdefault("max_grad_norm", args.max_grad_norm)
 
-    config["save_every"] = args.save_every
+    # CLI-only args: always use CLI value
     config["checkpoint_dir"] = args.checkpoint_dir
     config["resume"] = args.resume
     config["device"] = args.device
     config["max_samples"] = args.max_samples
-    config["grad_accum"] = args.grad_accum
-    config["head_dtype"] = args.head_dtype
-    config["batch_size"] = args.batch_size
-    config["warmup_steps"] = args.warmup_steps
-    config["max_grad_norm"] = args.max_grad_norm
 
     # Ensure numeric types (YAML can parse 1e-4 as string in some versions)
     config["learning_rate"] = float(config["learning_rate"])
@@ -181,7 +183,9 @@ def load_checkpoint(
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     if scheduler is not None and "scheduler_state_dict" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    print(f"  Resumed from step {ckpt['step']}, loss={ckpt.get('loss', '?'):.4f}")
+    loss_val = ckpt.get('loss')
+    loss_str = f"{loss_val:.4f}" if isinstance(loss_val, (int, float)) else "?"
+    print(f"  Resumed from step {ckpt['step']}, loss={loss_str}")
     return ckpt["step"]
 
 
@@ -404,12 +408,17 @@ def main() -> None:
     except Exception:
         print("  torch.compile: not available, continuing without")
 
-    param_count = sum(p.numel() for p in heads.parameters())
+    trainable_params = [p for p in heads.parameters() if p.requires_grad]
+    frozen_params = [p for p in heads.parameters() if not p.requires_grad]
+    param_count = sum(p.numel() for p in trainable_params)
+    frozen_count = sum(p.numel() for p in frozen_params)
     param_gb = param_count * (2 if head_dtype != torch.float32 else 4) / (1024**3)
-    print(f"  Head params:  {param_count:,} ({param_gb:.2f} GB in {config['head_dtype']})")
+    print(f"  Head params:  {param_count:,} trainable ({param_gb:.2f} GB in {config['head_dtype']})")
+    if frozen_count > 0:
+        print(f"  Frozen params: {frozen_count:,} (norm layer from backbone)")
 
-    # Optimizer (states always in fp32 for stability)
-    optimizer = torch.optim.AdamW(heads.parameters(), lr=config["learning_rate"])
+    # Optimizer (states always in fp32 for stability, only trainable params)
+    optimizer = torch.optim.AdamW(trainable_params, lr=config["learning_rate"])
     scaler = torch.amp.GradScaler("cuda", enabled=(head_dtype == torch.float16))
 
     # LR Scheduler: linear warmup + cosine decay
@@ -420,6 +429,7 @@ def main() -> None:
     )
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(max_steps - warmup_steps, 1),
+        eta_min=1e-5,
     )
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
@@ -490,7 +500,7 @@ def main() -> None:
         # Optimizer step (with gradient accumulation)
         if (step + 1) % grad_accum == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(heads.parameters(), max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)

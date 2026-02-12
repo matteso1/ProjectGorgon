@@ -45,3 +45,48 @@ def test_medusa_head_residual_shape_preservation():
     y = head(x)
     assert y.shape == (2, 4, 16)
     assert len(head.blocks) == 2
+
+
+def test_medusa_head_with_norm():
+    """Head with norm layer applies it before residual blocks."""
+    norm = torch.nn.LayerNorm(8)
+    head = MedusaHead(hidden_size=8, vocab_size=16, norm=norm)
+    x = torch.randn(2, 4, 8)
+    y = head(x)
+    assert y.shape == (2, 4, 16)
+    assert head.norm is not None
+
+
+def test_medusa_head_norm_frozen_not_trained():
+    """Frozen norm should not receive gradients during training."""
+    norm = torch.nn.LayerNorm(8)
+    for p in norm.parameters():
+        p.requires_grad = False
+
+    head = MedusaHead(hidden_size=8, vocab_size=16, norm=norm)
+    x = torch.randn(2, 4, 8)
+    targets = torch.tensor([1, 2], dtype=torch.long)
+
+    # Only optimize trainable params (not norm)
+    trainable = [p for p in head.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(trainable, lr=0.1)
+
+    norm_weight_before = norm.weight.detach().clone()
+
+    logits = head(x)
+    # Take first token from each batch for loss
+    loss = torch.nn.functional.cross_entropy(logits[:, 0, :], targets)
+    loss.backward()
+    optimizer.step()
+
+    # Norm weights should NOT change
+    assert torch.allclose(norm.weight, norm_weight_before)
+
+
+def test_medusa_head_without_norm_backward_compat():
+    """Head without norm (norm=None) should work identically to before."""
+    head = MedusaHead(hidden_size=8, vocab_size=16, norm=None)
+    assert head.norm is None
+    x = torch.randn(2, 4, 8)
+    y = head(x)
+    assert y.shape == (2, 4, 16)

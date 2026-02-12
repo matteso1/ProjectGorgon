@@ -1,15 +1,21 @@
-# Project Gorgon -- Medusa Head Training Config
+# Project Gorgon -- Medusa Head Training Config (v2)
 # For use with: python scripts/train_medusa_heads.py --config configs/train_heads.yaml
+#
+# v2 changes:
+#   - MedusaHead now includes frozen RMSNorm from backbone (better init)
+#   - 30k steps for proper convergence
+#   - Higher peak LR (3e-4) with cosine decay to 1e-5 (not zero)
+#   - 500 warmup steps for stable higher LR
 
 model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
 num_heads: 4
-max_steps: 10000
-learning_rate: 1e-4
+max_steps: 30000
+learning_rate: 3e-4
 dataset: "wikitext"
 seq_length: 512
 head_dtype: "bf16"    # bf16 for A100/H100, fp16 for older GPUs (V100)
 batch_size: 4
 grad_accum: 4
 save_every: 2000
-warmup_steps: 200
+warmup_steps: 500
 max_grad_norm: 1.0

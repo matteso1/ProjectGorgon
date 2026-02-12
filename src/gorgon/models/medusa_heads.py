@@ -22,14 +22,18 @@ class MedusaHead(nn.Module):
         hidden_size: int,
         vocab_size: int,
         num_residual_blocks: int = 1,
+        norm: nn.Module | None = None,
     ):
         super().__init__()
+        self.norm = norm
         self.blocks = nn.ModuleList(
             [ResidualBlock(hidden_size) for _ in range(num_residual_blocks)]
         )
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.norm is not None:
+            x = self.norm(x)
         for block in self.blocks:
             x = block(x)
         return self.lm_head(x)

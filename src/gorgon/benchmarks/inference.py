@@ -148,8 +148,32 @@ def run_speculative(
 
     end = timer()
 
+    # Extract enhanced metrics from iteration stats
+    mean_accepted_length = None
+    per_head_acceptance = None
+    tree_utilization = None
+    time_breakdown = None
+
+    if result.iteration_stats:
+        mean_accepted_length = result.mean_accepted_length
+        per_head_acceptance = result.per_head_acceptance_rates
+        tree_utilization = result.tree_utilization
+
+        total_draft_ms = sum(s.time_draft_ms for s in result.iteration_stats)
+        total_verify_ms = sum(s.time_verify_ms for s in result.iteration_stats)
+        total_trim_ms = sum(s.time_kv_trim_ms for s in result.iteration_stats)
+        time_breakdown = {
+            "draft_ms": total_draft_ms,
+            "verify_ms": total_verify_ms,
+            "kv_trim_ms": total_trim_ms,
+        }
+
     return TrialResult(
         token_count=len(result.generated_ids),
         elapsed_s=end - start,
         acceptance_rate=result.acceptance_rate,
+        mean_accepted_length=mean_accepted_length,
+        per_head_acceptance=per_head_acceptance,
+        tree_utilization=tree_utilization,
+        time_breakdown=time_breakdown,
     )

@@ -22,6 +22,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=4)
     parser.add_argument("--head-train-steps", type=int, default=0)
     parser.add_argument("--head-train-lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--heads-checkpoint",
+        type=str,
+        default=None,
+        help="Path to trained Medusa heads checkpoint (.pt file)",
+    )
     parser.add_argument("--dry-run", action="store_true", default=False)
     parser.add_argument(
         "--report-path",

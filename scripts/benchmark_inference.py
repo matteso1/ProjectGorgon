@@ -19,7 +19,7 @@ from gorgon.benchmarks.runner_core import run_benchmark_trials
 from gorgon.benchmarks.system import gather_system_info
 from gorgon.benchmarks.time_utils import current_date
 from gorgon.benchmarks.report import report_to_dict
-from gorgon.models.backbone import load_backbone_4bit
+from gorgon.models.backbone import load_backbone_4bit, load_trained_heads
 from gorgon.training.medusa_distill import distill_heads_last_token
 
 
@@ -50,7 +50,9 @@ def main() -> None:
             device_map=device,
             low_cpu_mem_usage=True,
         )
-        if args.head_train_steps > 0:
+        if args.heads_checkpoint:
+            load_trained_heads(args.heads_checkpoint, heads, device=device)
+        elif args.head_train_steps > 0:
             train_device = select_head_train_device(device)
             distill_heads_last_token(
                 backbone=model,
