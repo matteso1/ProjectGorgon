@@ -9,3 +9,17 @@ Implementation_Roadmap.md
 
 # Local journal
 journal.md
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+src/gorgon.egg-info/
+
+# Training artifacts
+checkpoints/
+*.pt
+
+# OS
+.DS_Store
